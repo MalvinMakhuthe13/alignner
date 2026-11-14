@@ -278,13 +278,15 @@ class ImageAligner:
         # ── 6. Propagate poses ──────────────────────────────────────
         poses = self.propagate_poses(pairs, n)
 
-        # Multi-view triangulation + filtering
-        sparse_pts, colors, tracks = self.triangulate_multiview(features, pairs, poses, K)
-
-        # First distribute relative camera constraints globally, then refine
-        # camera poses and 3D points against image observations.
+        # First distribute relative camera constraints globally. Triangulation
+        # must use the optimized camera geometry, not the initial chained poses.
         if len(poses) >= 2:
             poses = self.optimize_pose_graph(pairs, poses, components)
+
+        # Multi-view triangulation + filtering using globally refined poses.
+        sparse_pts, colors, tracks = self.triangulate_multiview(features, pairs, poses, K)
+
+        # Refine camera poses and 3D points jointly against image observations.
         if sparse_pts is not None and tracks and len(poses) >= 2:
             poses, sparse_pts = self.bundle_adjust(
                 features, poses, sparse_pts, tracks, K, components=components
@@ -292,20 +294,6 @@ class ImageAligner:
 
         if progress_callback:
             progress_callback(1.0, "Done")
-
-        logger.info(f"Triangulated {len(sparse_pts) if sparse_pts is not None else 0} sparse points")
-        logger.info(f"Poses recovered for {len(poses)} / {n} cameras")
-        logger.info(f"Alignment complete: {len(pairs)} verified pairs, {len(components)} components")
-
-        return AlignmentResult(
-            features=features,
-            pairs=pairs,
-            components=components,
-            camera_poses=poses,
-            sparse_points=sparse_pts,
-            point_colors=colors,
-            point_tracks=tracks,
-        )
 
         logger.info(f"Triangulated {len(sparse_pts) if sparse_pts is not None else 0} sparse points")
         logger.info(f"Poses recovered for {len(poses)} / {n} cameras")
