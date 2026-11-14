@@ -281,9 +281,9 @@ class ImageAligner:
         # Multi-view triangulation + filtering
         sparse_pts, colors, tracks = self.triangulate_multiview(features, pairs, poses, K)
 
-        # Lightweight bundle adjustment
-        if sparse_pts is not None and len(poses) >= 3:
-            poses, sparse_pts = self.bundle_adjust_light(features, poses, sparse_pts, tracks, K)
+        # Bundle adjustment is intentionally not applied here: the previous
+        # scale-only normalization was not an optimizer and could distort
+        # disconnected components. A real reprojection-error BA is a later stage.
 
         if progress_callback:
             progress_callback(1.0, "Done")
