@@ -281,8 +281,10 @@ class ImageAligner:
         # Multi-view triangulation + filtering
         sparse_pts, colors, tracks = self.triangulate_multiview(features, pairs, poses, K)
 
-        # Optimize each connected component independently; their coordinate
-        # frames are not comparable and must never be coupled in one BA solve.
+        # First distribute relative camera constraints globally, then refine
+        # camera poses and 3D points against image observations.
+        if len(poses) >= 2:
+            poses = self.optimize_pose_graph(pairs, poses, components)
         if sparse_pts is not None and tracks and len(poses) >= 2:
             poses, sparse_pts = self.bundle_adjust(
                 features, poses, sparse_pts, tracks, K, components=components
@@ -452,6 +454,110 @@ class ImageAligner:
         if not points:
             return None, None, None
         return np.asarray(points, dtype=np.float64), np.asarray(colors, dtype=np.uint8), tracks
+
+    def optimize_pose_graph(
+        self,
+        pairs: List[MatchPair],
+        poses: Dict[int, Tuple[np.ndarray, np.ndarray]],
+        components: List[List[int]],
+        max_nfev: int = 80,
+    ) -> Dict[int, Tuple[np.ndarray, np.ndarray]]:
+        """Robustly distribute pairwise rotation/translation constraints globally.
+
+        Translation scale is unknown in monocular two-view geometry, so each
+        edge receives a positive scalar. Components are solved independently
+        with one fixed anchor pose each.
+        """
+        from scipy.optimize import least_squares
+        from scipy.spatial.transform import Rotation
+
+        refined = {
+            idx: (np.asarray(R, dtype=np.float64).reshape(3, 3).copy(),
+                  np.asarray(t, dtype=np.float64).reshape(3, 1).copy())
+            for idx, (R, t) in poses.items()
+        }
+        for component in components:
+            camera_ids = sorted(idx for idx in component if idx in refined)
+            if len(camera_ids) < 2:
+                continue
+            camera_set = set(camera_ids)
+            edges = [
+                pair for pair in pairs
+                if pair.idx1 in camera_set and pair.idx2 in camera_set
+                and pair.R is not None and pair.t is not None
+            ]
+            if len(edges) < len(camera_ids) - 1:
+                continue
+
+            anchor = camera_ids[0]
+            variable_ids = camera_ids[1:]
+            offsets = {idx: 6 * i for i, idx in enumerate(variable_ids)}
+            edge_offset = 6 * len(variable_ids)
+            initial_pose = {}
+            for idx in variable_ids:
+                R, t = refined[idx]
+                initial_pose[idx] = np.concatenate([
+                    Rotation.from_matrix(R).as_rotvec(), t.reshape(3)
+                ])
+            scales = []
+            for edge in edges:
+                Ri, ti = refined[edge.idx1]
+                Rj, tj = refined[edge.idx2]
+                Rrel = np.asarray(edge.R, dtype=np.float64).reshape(3, 3)
+                trel = np.asarray(edge.t, dtype=np.float64).reshape(3)
+                predicted_t = tj.reshape(3) - (Rj @ Ri.T) @ ti.reshape(3)
+                denom = float(trel @ trel)
+                scale = float(predicted_t @ trel / denom) if denom > 1e-10 else 1.0
+                scales.append(max(scale, 1e-3))
+            x0 = np.concatenate(
+                [np.concatenate([initial_pose[idx] for idx in variable_ids]),
+                 np.asarray(scales, dtype=np.float64)]
+            )
+
+            def unpack(params):
+                local = {anchor: refined[anchor]}
+                for idx in variable_ids:
+                    off = offsets[idx]
+                    R = Rotation.from_rotvec(params[off:off + 3]).as_matrix()
+                    t = params[off + 3:off + 6].reshape(3, 1)
+                    local[idx] = (R, t)
+                return local
+
+            def residuals(params):
+                local = unpack(params)
+                residual = []
+                for edge_index, edge in enumerate(edges):
+                    Ri, ti = local[edge.idx1]
+                    Rj, tj = local[edge.idx2]
+                    R_meas = np.asarray(edge.R, dtype=np.float64).reshape(3, 3)
+                    t_meas = np.asarray(edge.t, dtype=np.float64).reshape(3)
+                    R_pred = Rj @ Ri.T
+                    rotation_error = Rotation.from_matrix(R_meas.T @ R_pred).as_rotvec()
+                    translation_error = (
+                        tj.reshape(3) - R_pred @ ti.reshape(3)
+                        - params[edge_offset + edge_index] * t_meas
+                    )
+                    residual.extend(rotation_error.tolist())
+                    residual.extend(translation_error.tolist())
+                return np.asarray(residual, dtype=np.float64)
+
+            try:
+                lower = np.full_like(x0, -np.inf)
+                upper = np.full_like(x0, np.inf)
+                lower[edge_offset:] = 1e-4
+                optimized = least_squares(
+                    residuals, x0, bounds=(lower, upper),
+                    loss="soft_l1", f_scale=0.05, max_nfev=max_nfev,
+                )
+                if np.all(np.isfinite(optimized.x)):
+                    local = unpack(optimized.x)
+                    refined.update(local)
+                    logger.info("Pose graph optimized %d cameras / %d edges (cost %.5f)",
+                                len(camera_ids), len(edges), optimized.cost)
+            except (ValueError, np.linalg.LinAlgError) as exc:
+                logger.warning("Pose graph optimization skipped for component %s: %s",
+                               camera_ids, exc)
+        return refined
 
     def bundle_adjust(
         self,
