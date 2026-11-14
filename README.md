@@ -46,7 +46,7 @@ streamlit run app.py
 ## Current Limitations
 
 - Approximate shared intrinsics
-- Pairwise relative poses; no global pose-graph optimization yet
+- Pairwise relative pose initialization followed by robust per-component pose-graph optimization
 - Approximate shared intrinsics; mixed camera models and EXIF calibration are not yet handled
 - Sparse reconstruction only; no dense reconstruction or meshing yet
 - Disconnected components have independent local coordinate systems and cannot be merged without additional constraints
@@ -56,8 +56,8 @@ For production work use RealityScan, COLMAP, or Meshroom.
 
 ## Roadmap
 
-- Incremental structure-from-motion and global pose optimization
-- True robust bundle adjustment (per-component reprojection optimization is now implemented)
+- Incremental structure-from-motion
+- Robust per-component pose-graph optimization and reprojection-error bundle adjustment
 - Dense reconstruction and meshing integration
 - Masking support
 - Better video keyframe selection
