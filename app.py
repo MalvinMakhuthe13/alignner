@@ -35,7 +35,8 @@ min_inliers = st.sidebar.slider("Min Inliers", 8, 80, 15)
 focal_override = st.sidebar.number_input("Focal Length (px, 0=auto)", 0.0, step=50.0)
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("Video Frame Extraction")
+st.sidebar.subheader("Large sets")
+st.sidebar.caption("With >40 images the engine automatically switches to nearby + sparse long-range matching so it stays fast.")
 fps_extract = st.sidebar.slider("Extract every Nth frame (or FPS)", 1, 30, 5)
 max_frames = st.sidebar.slider("Max frames per video", 10, 200, 60)
 
@@ -107,6 +108,13 @@ if st.button("🚀 Align", type="primary"):
         st.error("Need at least 2 images/frames to align.")
     else:
         with st.spinner(f"Aligning {len(all_paths)} images/frames..."):
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+
+            def update_progress(frac, msg):
+                progress_bar.progress(min(1.0, float(frac)))
+                status_text.caption(msg)
+
             aligner = ImageAligner(
                 feature_detector=detector,
                 max_features=max_features,
@@ -114,7 +122,14 @@ if st.button("🚀 Align", type="primary"):
                 min_inliers=min_inliers,
             )
             focal = float(focal_override) if focal_override > 0 else None
-            result = aligner.align(all_paths, focal_length=focal)
+            result = aligner.align(
+                all_paths,
+                focal_length=focal,
+                progress_callback=update_progress,
+            )
+
+            progress_bar.progress(1.0)
+            status_text.caption("Finished")
 
         st.success(f"Done — {len(result.features)} images, {len(result.pairs)} verified pairs")
 

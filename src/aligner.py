@@ -59,11 +59,15 @@ class ImageAligner:
         match_ratio: float = 0.75,
         min_inliers: int = 20,
         ransac_thresh: float = 1.0,
+        match_window: int = 15,          # sequential: match each image to next N
+        use_sequential: bool = True,     # False = exhaustive (slow for large N)
     ):
         self.max_features = max_features
         self.match_ratio = match_ratio
         self.min_inliers = min_inliers
         self.ransac_thresh = ransac_thresh
+        self.match_window = match_window
+        self.use_sequential = use_sequential
 
         if feature_detector.lower() == "sift":
             self.detector = cv2.SIFT_create(nfeatures=max_features)
@@ -171,71 +175,89 @@ class ImageAligner:
         image_paths: List[str],
         focal_length: Optional[float] = None,
         principal_point: Optional[Tuple[float, float]] = None,
+        progress_callback=None,
+        max_neighbors: int = 12,
     ) -> AlignmentResult:
         """
         Main alignment pipeline.
-        - Extract features from all images
-        - Pairwise matching + geometric verification
-        - Build connectivity graph
-        - Estimate relative poses (assuming first image as origin for simple case)
+        For large sets (>40 images) only matches nearby + a few long-range pairs
+        so it stays practical while still connecting the sequence.
         """
         logger.info(f"Aligning {len(image_paths)} images...")
 
-        # Load & extract features
+        # ── 1. Load & extract features ──────────────────────────────
         features: List[ImageFeatures] = []
-        for p in image_paths:
+        n_total = len(image_paths)
+        for i, p in enumerate(image_paths):
             img = self.load_image(p)
             if img is not None:
                 feat = self.extract_features(img, p)
                 features.append(feat)
                 logger.info(f"  {Path(p).name}: {len(feat.keypoints)} features")
+            if progress_callback:
+                progress_callback(0.15 * (i + 1) / max(n_total, 1), f"Extracting features {i+1}/{n_total}")
 
-        if len(features) < 2:
+        n = len(features)
+        if n < 2:
             return AlignmentResult(features=features, pairs=[], components=[])
 
-        # Approximate intrinsics if not provided (assume pinhole, focal = max dim)
+        # ── 2. Intrinsics ───────────────────────────────────────────
         if focal_length is None:
-            # Use average image size heuristic
             avg_size = np.mean([max(f.width, f.height) for f in features])
-            focal_length = avg_size * 1.2  # common heuristic
+            focal_length = avg_size * 1.2
 
-        # Build camera matrix (same for all for simplicity; real apps estimate per camera)
         sample = features[0]
         cx = principal_point[0] if principal_point else sample.width / 2.0
         cy = principal_point[1] if principal_point else sample.height / 2.0
         K = np.array([[focal_length, 0, cx], [0, focal_length, cy], [0, 0, 1]], dtype=np.float64)
 
-        # Pairwise matching
-        pairs: List[MatchPair] = []
-        n = len(features)
-        for i in range(n):
-            for j in range(i + 1, n):
-                matches = self.match_features(features[i].descriptors, features[j].descriptors)
-                if len(matches) < self.min_inliers:
-                    continue
+        # ── 3. Decide which pairs to match ──────────────────────────
+        if n <= 40:
+            # Full pairwise for small sets
+            candidate_pairs = [(i, j) for i in range(n) for j in range(i + 1, n)]
+        else:
+            # Smart mode: nearby images + sparse long-range links
+            candidate_pairs = []
+            for i in range(n):
+                # Nearby
+                for d in range(1, max_neighbors + 1):
+                    j = i + d
+                    if j < n:
+                        candidate_pairs.append((i, j))
+                # Occasional longer jump to help connectivity
+                if i % 8 == 0:
+                    for d in range(max_neighbors + 1, min(max_neighbors * 3, n - i)):
+                        if d % 3 == 0:
+                            candidate_pairs.append((i, i + d))
 
+        total_pairs = len(candidate_pairs)
+        logger.info(f"Matching {total_pairs} candidate pairs (smart mode: {n > 40})")
+
+        # ── 4. Matching ─────────────────────────────────────────────
+        pairs: List[MatchPair] = []
+        for k, (i, j) in enumerate(candidate_pairs):
+            matches = self.match_features(features[i].descriptors, features[j].descriptors)
+            if len(matches) >= self.min_inliers:
                 F, E, inliers, inlier_matches = self.geometric_verification(
                     features[i].keypoints, features[j].keypoints, matches, K
                 )
                 if inliers >= self.min_inliers:
-                    R, t, pose_inliers = self.estimate_relative_pose(
+                    R, t, _ = self.estimate_relative_pose(
                         features[i].keypoints, features[j].keypoints, inlier_matches, K
                     )
                     pairs.append(
                         MatchPair(
-                            idx1=i,
-                            idx2=j,
-                            matches=inlier_matches,
-                            inliers=inliers,
-                            fundamental=F,
-                            essential=E,
-                            R=R,
-                            t=t,
+                            idx1=i, idx2=j, matches=inlier_matches, inliers=inliers,
+                            fundamental=F, essential=E, R=R, t=t,
                         )
                     )
                     logger.info(f"  Pair ({i},{j}): {inliers} inliers")
 
-        # Connected components (simple graph)
+            if progress_callback and k % 5 == 0:
+                progress_callback(0.15 + 0.75 * (k + 1) / total_pairs,
+                                  f"Matching pairs {k+1}/{total_pairs}")
+
+        # ── 5. Components ───────────────────────────────────────────
         from collections import defaultdict
         graph = defaultdict(list)
         for p in pairs:
@@ -257,16 +279,20 @@ class ImageAligner:
                 if comp:
                     components.append(sorted(comp))
 
-        # Simple camera poses: first image identity, others from best pair to first if possible
+        # ── 6. Simple poses (relative to image 0 when possible) ─────
         poses = {0: (np.eye(3), np.zeros((3, 1)))}
         for p in pairs:
-            if p.idx1 == 0 and p.R is not None and p.t is not None:
+            if p.R is None or p.t is None:
+                continue
+            if p.idx1 == 0:
                 poses[p.idx2] = (p.R, p.t)
-            elif p.idx2 == 0 and p.R is not None and p.t is not None:
-                # Invert relative pose
+            elif p.idx2 == 0:
                 R_inv = p.R.T
                 t_inv = -R_inv @ p.t
                 poses[p.idx1] = (R_inv, t_inv)
+
+        if progress_callback:
+            progress_callback(1.0, "Done")
 
         logger.info(f"Alignment complete: {len(pairs)} verified pairs, {len(components)} components")
         return AlignmentResult(
