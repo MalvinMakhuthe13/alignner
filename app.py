@@ -154,20 +154,36 @@ if st.session_state.get("alignment_done") and "alignment_result" in st.session_s
         names = [Path(result.features[j].path).name for j in comp]
         st.write(f"**Component {i+1}** ({len(comp)}): {', '.join(names[:8])}{'...' if len(names)>8 else ''}")
 
-    # Match browser
+    # Match browser (all pairs)
     if result.pairs:
         st.subheader("Browse Matches")
+        sorted_pairs = sorted(result.pairs, key=lambda x: -x.inliers)
         pair_options = []
-        for i, p in enumerate(sorted(result.pairs, key=lambda x: -x.inliers)):
+        for p in sorted_pairs:
             name1 = Path(result.features[p.idx1].path).name
             name2 = Path(result.features[p.idx2].path).name
             pair_options.append(f"{name1}  ↔  {name2}  ({p.inliers} inliers)")
 
-        selected_pair = st.selectbox("Select a matched pair", pair_options, index=0)
-        pair_idx = pair_options.index(selected_pair)
-        best_pairs = sorted(result.pairs, key=lambda x: -x.inliers)
-        chosen = best_pairs[pair_idx]
+        if "match_idx" not in st.session_state:
+            st.session_state.match_idx = 0
 
+        col_prev, col_sel, col_next = st.columns([1, 6, 1])
+        with col_prev:
+            if st.button("← Prev") and st.session_state.match_idx > 0:
+                st.session_state.match_idx -= 1
+        with col_next:
+            if st.button("Next →") and st.session_state.match_idx < len(pair_options) - 1:
+                st.session_state.match_idx += 1
+        with col_sel:
+            selected_pair = st.selectbox(
+                "Select a matched pair",
+                pair_options,
+                index=st.session_state.match_idx,
+                key="pair_select",
+            )
+            st.session_state.match_idx = pair_options.index(selected_pair)
+
+        chosen = sorted_pairs[st.session_state.match_idx]
         f1 = result.features[chosen.idx1]
         f2 = result.features[chosen.idx2]
         if f1.image is not None and f2.image is not None:
@@ -175,10 +191,10 @@ if st.session_state.get("alignment_done") and "alignment_result" in st.session_s
                 f1.image, f1.keypoints,
                 f2.image, f2.keypoints,
                 chosen.matches,
-                max_draw=80,
+                max_draw=100,
             )
             st.image(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB), caption=f"{chosen.inliers} inliers", use_container_width=True)
-            st.caption("Green lines = verified matches. Use the dropdown to step through different pairs.")
+            st.caption(f"Pair {st.session_state.match_idx + 1} of {len(sorted_pairs)} • Green lines = verified matches")
 
     # 3D cameras + sparse points
     if result.camera_poses or (result.sparse_points is not None):
@@ -197,11 +213,9 @@ if st.session_state.get("alignment_done") and "alignment_result" in st.session_s
                 pos = np.array(positions)
                 fig.add_trace(go.Scatter3d(
                     x=pos[:,0], y=pos[:,1], z=pos[:,2],
-                    mode="markers+lines+text",
-                    text=labels,
-                    textposition="top center",
-                    marker=dict(size=5, color="cyan"),
-                    line=dict(color="cyan", width=2),
+                    mode="markers+lines",
+                    marker=dict(size=4, color="cyan", line=dict(width=1, color="darkblue")),
+                    line=dict(color="deepskyblue", width=4),
                     name="Camera path",
                 ))
 
@@ -290,17 +304,7 @@ if st.session_state.get("alignment_done") and "alignment_result" in st.session_s
                 )
             st.success("COLMAP export ready (cameras.txt, images.txt, points3D.txt + images/)")
 
-    # Sample matches
-    if result.pairs:
-        st.subheader("Best Matches")
-        best = max(result.pairs, key=lambda p: p.inliers)
-        f1 = result.features[best.idx1]
-        f2 = result.features[best.idx2]
-        if f1.image is not None and f2.image is not None:
-            vis = visualize_matches(f1.image, f1.keypoints, f2.image, f2.keypoints, best.matches, 50)
-            st.image(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB), caption=f"{best.inliers} inliers")
-
-    # Export
+    # Export JSON
     if result.camera_poses:
         export = {
             "num_images": len(result.features),
