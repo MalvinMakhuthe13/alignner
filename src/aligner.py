@@ -336,64 +336,119 @@ class ImageAligner:
         max_points: int = 40000,
         reproj_thresh: float = 2.5,
     ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[List]]:
-        """Triangulate and keep points seen in ≥2 views with low reprojection error."""
-        from collections import defaultdict
+        """Build conflict-free feature tracks across image pairs, then triangulate tracks.
 
-        # Collect observations per feature track (simple: per pair match)
-        points, colors, tracks = [], [], []
-        point_id = 0
+        Track observations use (point_id, image_index, keypoint_index). A track
+        cannot contain two different keypoints from the same image.
+        """
+        parent = {}
+        observations = {}
+
+        def find(node):
+            parent.setdefault(node, node)
+            if parent[node] != node:
+                parent[node] = find(parent[node])
+            return parent[node]
+
+        def union(left, right):
+            rl, rr = find(left), find(right)
+            if rl == rr:
+                return True
+            ol, or_ = observations.get(rl, {left[0]: left[1]}), observations.get(rr, {right[0]: right[1]})
+            if any(image_id in or_ and or_[image_id] != kp_id for image_id, kp_id in ol.items()):
+                return False
+            parent[rr] = rl
+            observations[rl] = {**or_, **ol}
+            return True
 
         for pair in pairs:
-            if pair.idx1 not in poses or pair.idx2 not in poses or len(pair.matches) < 8:
+            if pair.idx1 not in poses or pair.idx2 not in poses:
+                continue
+            for match in pair.matches:
+                left = (pair.idx1, match.queryIdx)
+                right = (pair.idx2, match.trainIdx)
+                rl, rr = find(left), find(right)
+                if rl == rr:
+                    continue
+                observations.setdefault(rl, {left[0]: left[1]})
+                observations.setdefault(rr, {right[0]: right[1]})
+                union(left, right)
+
+        tracks_by_root = {}
+        for node in list(parent):
+            root = find(node)
+            tracks_by_root.setdefault(root, {})[node[0]] = node[1]
+
+        points, colors, tracks = [], [], []
+        for obs in tracks_by_root.values():
+            valid = [(img_id, kp_id) for img_id, kp_id in sorted(obs.items())
+                     if img_id in poses and kp_id < len(features[img_id].keypoints)]
+            if len(valid) < 2:
                 continue
 
-            R1, t1 = poses[pair.idx1]
-            R2, t2 = poses[pair.idx2]
-            P1 = K @ np.hstack((R1, t1.reshape(3, 1)))
-            P2 = K @ np.hstack((R2, t2.reshape(3, 1)))
+            # Triangulate using the widest-baseline pair in this track.
+            best = None
+            best_baseline = -1.0
+            for i in range(len(valid)):
+                for j in range(i + 1, len(valid)):
+                    ia, _ = valid[i]
+                    ib, _ = valid[j]
+                    Ra, ta = poses[ia]
+                    Rb, tb = poses[ib]
+                    ca = -Ra.T @ ta.reshape(3)
+                    cb = -Rb.T @ tb.reshape(3)
+                    baseline = float(np.linalg.norm(ca - cb))
+                    if baseline > best_baseline:
+                        best_baseline, best = baseline, (valid[i], valid[j])
+            if best is None or best_baseline < 1e-8:
+                continue
 
-            pts1 = np.float32([features[pair.idx1].keypoints[m.queryIdx].pt for m in pair.matches]).T
-            pts2 = np.float32([features[pair.idx2].keypoints[m.trainIdx].pt for m in pair.matches]).T
+            (ia, ka), (ib, kb) = best
+            Ra, ta = poses[ia]
+            Rb, tb = poses[ib]
+            P1 = K @ np.hstack((Ra, np.asarray(ta).reshape(3, 1)))
+            P2 = K @ np.hstack((Rb, np.asarray(tb).reshape(3, 1)))
+            uv1 = np.asarray(features[ia].keypoints[ka].pt, dtype=np.float64).reshape(2, 1)
+            uv2 = np.asarray(features[ib].keypoints[kb].pt, dtype=np.float64).reshape(2, 1)
+            h = cv2.triangulatePoints(P1, P2, uv1, uv2).reshape(4)
+            if abs(h[3]) < 1e-10:
+                continue
+            point = h[:3] / h[3]
+            if not np.all(np.isfinite(point)):
+                continue
 
-            pts4d = cv2.triangulatePoints(P1, P2, pts1, pts2)
-            pts3d = (pts4d[:3] / (pts4d[3] + 1e-8)).T
-
-            for i, pt in enumerate(pts3d):
-                if np.any(np.isnan(pt)) or np.linalg.norm(pt) > 50:
-                    continue
-
-                # Reprojection check (tighter)
-                def reproj(P, pt3, uv):
-                    p = P @ np.append(pt3, 1)
-                    if abs(p[2]) < 1e-6:
-                        return 999
-                    p = p[:2] / p[2]
-                    return np.linalg.norm(p - uv)
-
-                err1 = reproj(P1, pt, pts1[:, i])
-                err2 = reproj(P2, pt, pts2[:, i])
-                if err1 > 2.5 or err2 > 2.5:
-                    continue
-
-                points.append(pt)
-                x, y = int(pts1[0, i]), int(pts1[1, i])
-                img = features[pair.idx1].image
-                if img is not None and 0 <= y < img.shape[0] and 0 <= x < img.shape[1]:
-                    colors.append(img[y, x][::-1])
-                else:
-                    colors.append([140, 140, 140])
-
-                tracks.append((point_id, pair.idx1, pair.matches[i].queryIdx))
-                tracks.append((point_id, pair.idx2, pair.matches[i].trainIdx))
-                point_id += 1
-                if len(points) >= max_points:
+            # Require positive depth and bounded reprojection error in every view.
+            accepted = True
+            for img_id, kp_id in valid:
+                R, t = poses[img_id]
+                camera_point = R @ point.reshape(3, 1) + np.asarray(t).reshape(3, 1)
+                if camera_point[2, 0] <= 1e-8:
+                    accepted = False
                     break
+                projected = K @ camera_point
+                projected = (projected[:2] / projected[2, 0]).ravel()
+                observed = np.asarray(features[img_id].keypoints[kp_id].pt)
+                if np.linalg.norm(projected - observed) > reproj_thresh:
+                    accepted = False
+                    break
+            if not accepted:
+                continue
+
+            points.append(point)
+            color_img = features[ia].image
+            x, y = map(int, features[ia].keypoints[ka].pt)
+            if color_img is not None and 0 <= y < color_img.shape[0] and 0 <= x < color_img.shape[1]:
+                colors.append(color_img[y, x][::-1].tolist())
+            else:
+                colors.append([140, 140, 140])
+            point_id = len(points) - 1
+            tracks.extend((point_id, img_id, kp_id) for img_id, kp_id in valid)
             if len(points) >= max_points:
                 break
 
         if not points:
             return None, None, None
-        return np.array(points), np.array(colors), tracks
+        return np.asarray(points, dtype=np.float64), np.asarray(colors, dtype=np.uint8), tracks
 
     def bundle_adjust_light(
         self,
