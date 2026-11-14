@@ -281,9 +281,12 @@ class ImageAligner:
         # Multi-view triangulation + filtering
         sparse_pts, colors, tracks = self.triangulate_multiview(features, pairs, poses, K)
 
-        # Bundle adjustment is intentionally not applied here: the previous
-        # scale-only normalization was not an optimizer and could distort
-        # disconnected components. A real reprojection-error BA is a later stage.
+        # Optimize each connected component independently; their coordinate
+        # frames are not comparable and must never be coupled in one BA solve.
+        if sparse_pts is not None and tracks and len(poses) >= 2:
+            poses, sparse_pts = self.bundle_adjust(
+                features, poses, sparse_pts, tracks, K, components=components
+            )
 
         if progress_callback:
             progress_callback(1.0, "Done")
@@ -449,6 +452,121 @@ class ImageAligner:
         if not points:
             return None, None, None
         return np.asarray(points, dtype=np.float64), np.asarray(colors, dtype=np.uint8), tracks
+
+    def bundle_adjust(
+        self,
+        features: List[ImageFeatures],
+        poses: Dict[int, Tuple[np.ndarray, np.ndarray]],
+        points: np.ndarray,
+        tracks: List,
+        K: np.ndarray,
+        components: Optional[List[List[int]]] = None,
+        max_points_per_component: int = 500,
+        max_nfev: int = 25,
+    ) -> Tuple[Dict[int, Tuple[np.ndarray, np.ndarray]], np.ndarray]:
+        """Robust reprojection-error bundle adjustment, optimized per component.
+
+        One camera per component is fixed to remove the 6-DoF gauge freedom.
+        Components are optimized independently because their world frames are
+        unrelated. SciPy is already a project dependency.
+        """
+        from scipy.optimize import least_squares
+        from scipy.spatial.transform import Rotation
+
+        if points is None or len(points) == 0 or not tracks:
+            return poses, points
+
+        components = components or [sorted(poses)]
+        refined_poses = {idx: (np.asarray(R).copy(), np.asarray(t).reshape(3, 1).copy())
+                         for idx, (R, t) in poses.items()}
+        refined_points = np.asarray(points, dtype=np.float64).copy()
+
+        observations_by_point = {}
+        for point_id, image_idx, keypoint_idx in tracks:
+            if (0 <= point_id < len(refined_points) and image_idx in poses
+                    and 0 <= keypoint_idx < len(features[image_idx].keypoints)):
+                uv = np.asarray(features[image_idx].keypoints[keypoint_idx].pt, dtype=np.float64)
+                observations_by_point.setdefault(int(point_id), []).append((int(image_idx), uv))
+
+        for component in components:
+            camera_ids = sorted(idx for idx in component if idx in refined_poses)
+            if len(camera_ids) < 2:
+                continue
+            camera_set = set(camera_ids)
+            point_ids = [
+                pid for pid, obs in observations_by_point.items()
+                if len({img for img, _ in obs if img in camera_set}) >= 2
+            ][:max_points_per_component]
+            if len(point_ids) < 8:
+                continue
+
+            anchor = camera_ids[0]
+            variable_cameras = camera_ids[1:]
+            point_lookup = {pid: i for i, pid in enumerate(point_ids)}
+            obs_rows = []
+            for pid in point_ids:
+                for image_idx, uv in observations_by_point[pid]:
+                    if image_idx in camera_set:
+                        obs_rows.append((image_idx, point_lookup[pid], uv))
+            if len(obs_rows) < 16:
+                continue
+
+            initial_rot = {idx: Rotation.from_matrix(refined_poses[idx][0]).as_rotvec()
+                           for idx in variable_cameras}
+            initial_t = {idx: refined_poses[idx][1].reshape(3) for idx in variable_cameras}
+            initial_points = refined_points[point_ids].copy()
+            x0 = np.concatenate(
+                [np.concatenate([initial_rot[i], initial_t[i]]) for i in variable_cameras]
+                + [initial_points.reshape(-1)]
+            )
+            camera_offset = {idx: 6 * i for i, idx in enumerate(variable_cameras)}
+            points_offset = 6 * len(variable_cameras)
+
+            def unpack(params):
+                local_poses = {anchor: refined_poses[anchor]}
+                for idx in variable_cameras:
+                    off = camera_offset[idx]
+                    R = Rotation.from_rotvec(params[off:off + 3]).as_matrix()
+                    t = params[off + 3:off + 6].reshape(3, 1)
+                    local_poses[idx] = (R, t)
+                local_points = params[points_offset:].reshape(-1, 3)
+                return local_poses, local_points
+
+            def residuals(params):
+                local_poses, local_points = unpack(params)
+                residual = np.empty((len(obs_rows), 2), dtype=np.float64)
+                for row, (image_idx, point_slot, observed) in enumerate(obs_rows):
+                    R, t = local_poses[image_idx]
+                    camera_point = R @ local_points[point_slot].reshape(3, 1) + t
+                    z = float(camera_point[2, 0])
+                    if z <= 1e-6:
+                        residual[row] = [1000.0 + abs(z), 1000.0 + abs(z)]
+                        continue
+                    projected = K @ camera_point
+                    uv = (projected[:2] / projected[2, 0]).reshape(2)
+                    residual[row] = uv - observed
+                return residual.reshape(-1)
+
+            try:
+                optimized = least_squares(
+                    residuals, x0, loss="soft_l1", f_scale=2.0,
+                    max_nfev=max_nfev, method="trf",
+                )
+                if not np.all(np.isfinite(optimized.x)):
+                    continue
+                local_poses, local_points = unpack(optimized.x)
+                for idx, pose in local_poses.items():
+                    refined_poses[idx] = (pose[0], pose[1].reshape(3, 1))
+                refined_points[point_ids] = local_points
+                logger.info(
+                    "Bundle adjustment component %s: %.3f -> %.3f px robust cost",
+                    camera_ids, optimized.cost * 2 / max(len(obs_rows), 1),
+                    np.mean(np.abs(optimized.fun)),
+                )
+            except (ValueError, np.linalg.LinAlgError) as exc:
+                logger.warning("Bundle adjustment skipped for component %s: %s", camera_ids, exc)
+
+        return refined_poses, refined_points
 
     def bundle_adjust_light(
         self,
