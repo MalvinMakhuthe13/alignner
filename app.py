@@ -172,10 +172,11 @@ if st.session_state.get("alignment_done") and "alignment_result" in st.session_s
         st.subheader("Cameras + Sparse Points")
         fig = go.Figure()
 
-        # Cameras
+        # Cameras (as larger markers + path)
         if result.camera_poses:
             positions, labels = [], []
-            for idx, (R, t) in result.camera_poses.items():
+            for idx in sorted(result.camera_poses.keys()):
+                R, t = result.camera_poses[idx]
                 C = -R.T @ t.flatten()
                 positions.append(C)
                 labels.append(Path(result.features[idx].path).name)
@@ -183,32 +184,29 @@ if st.session_state.get("alignment_done") and "alignment_result" in st.session_s
                 pos = np.array(positions)
                 fig.add_trace(go.Scatter3d(
                     x=pos[:,0], y=pos[:,1], z=pos[:,2],
-                    mode="markers+text",
+                    mode="markers+lines+text",
                     text=labels,
                     textposition="top center",
-                    marker=dict(size=6, color="cyan"),
-                    name="Cameras",
+                    marker=dict(size=5, color="cyan"),
+                    line=dict(color="cyan", width=2),
+                    name="Camera path",
                 ))
 
         # Sparse points
         if result.sparse_points is not None and len(result.sparse_points) > 0:
             pts = result.sparse_points
-            # Subsample for display if huge
-            if len(pts) > 15000:
-                idx = np.random.choice(len(pts), 15000, replace=False)
-                pts = pts[idx]
+            if len(pts) > 20000:
+                idx = np.random.choice(len(pts), 20000, replace=False)
+                pts_disp = pts[idx]
                 cols = result.point_colors[idx] if result.point_colors is not None else None
             else:
+                pts_disp = pts
                 cols = result.point_colors
 
             fig.add_trace(go.Scatter3d(
-                x=pts[:,0], y=pts[:,1], z=pts[:,2],
+                x=pts_disp[:,0], y=pts_disp[:,1], z=pts_disp[:,2],
                 mode="markers",
-                marker=dict(
-                    size=2,
-                    color=cols if cols is not None else "orange",
-                    opacity=0.7,
-                ),
+                marker=dict(size=1.8, color=cols if cols is not None else "orange", opacity=0.65),
                 name="Sparse points",
             ))
 
@@ -219,13 +217,38 @@ if st.session_state.get("alignment_done") and "alignment_result" in st.session_s
             name="Origin",
         ))
         fig.update_layout(
-            scene=dict(aspectmode="data"),
-            height=560,
+            scene=dict(
+                aspectmode="data",
+                xaxis_title="X", yaxis_title="Y", zaxis_title="Z",
+            ),
+            height=700,
             margin=dict(l=0, r=0, b=0, t=30),
         )
         st.plotly_chart(fig, use_container_width=True)
         npts = 0 if result.sparse_points is None else len(result.sparse_points)
-        st.caption(f"{npts} sparse points triangulated. Inspect coverage before sending to Brush / Gaussian splatting.")
+        nposed = len(result.camera_poses)
+        st.caption(f"{nposed} cameras posed • {npts} sparse points. Drag to rotate, scroll to zoom.")
+
+    # Image browser
+    st.subheader("Browse Images")
+    if result.features:
+        names = [Path(f.path).name for f in result.features]
+        selected = st.selectbox("Select image", names, index=0)
+        sel_idx = names.index(selected)
+        feat = result.features[sel_idx]
+        if feat.image is not None:
+            col_a, col_b = st.columns([2, 1])
+            with col_a:
+                st.image(cv2.cvtColor(feat.image, cv2.COLOR_BGR2RGB), caption=selected, use_container_width=True)
+            with col_b:
+                st.write(f"**Size:** {feat.width} × {feat.height}")
+                st.write(f"**Features:** {len(feat.keypoints)}")
+                posed = "Yes" if sel_idx in result.camera_poses else "No"
+                st.write(f"**Pose recovered:** {posed}")
+                if sel_idx in result.camera_poses:
+                    R, t = result.camera_poses[sel_idx]
+                    C = -R.T @ t.flatten()
+                    st.write(f"**Camera center:** ({C[0]:.2f}, {C[1]:.2f}, {C[2]:.2f})")
 
     # COLMAP export
     if st.button("Export COLMAP dataset"):

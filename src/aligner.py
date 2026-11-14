@@ -282,17 +282,8 @@ class ImageAligner:
                 if comp:
                     components.append(sorted(comp))
 
-        # ── 6. Simple poses (relative to image 0 when possible) ─────
-        poses = {0: (np.eye(3), np.zeros((3, 1)))}
-        for p in pairs:
-            if p.R is None or p.t is None:
-                continue
-            if p.idx1 == 0:
-                poses[p.idx2] = (p.R, p.t)
-            elif p.idx2 == 0:
-                R_inv = p.R.T
-                t_inv = -R_inv @ p.t
-                poses[p.idx1] = (R_inv, t_inv)
+        # ── 6. Propagate poses along the connected component ─────────
+        poses = self.propagate_poses(pairs, n)
 
         if progress_callback:
             progress_callback(1.0, "Done")
@@ -300,6 +291,7 @@ class ImageAligner:
         # Triangulate sparse points
         sparse_pts, colors, tracks = self.triangulate_sparse(features, pairs, poses, K)
         logger.info(f"Triangulated {len(sparse_pts) if sparse_pts is not None else 0} sparse points")
+        logger.info(f"Poses recovered for {len(poses)} / {n} cameras")
 
         logger.info(f"Alignment complete: {len(pairs)} verified pairs, {len(components)} components")
         return AlignmentResult(
@@ -311,6 +303,41 @@ class ImageAligner:
             point_colors=colors,
             point_tracks=tracks,
         )
+
+    def propagate_poses(self, pairs: List[MatchPair], n: int) -> Dict[int, Tuple[np.ndarray, np.ndarray]]:
+        """Chain relative poses from image 0 across the whole connected component."""
+        from collections import defaultdict, deque
+
+        # Build adjacency with relative transforms
+        adj = defaultdict(list)
+        for p in pairs:
+            if p.R is None or p.t is None:
+                continue
+            # Store both directions
+            adj[p.idx1].append((p.idx2, p.R, p.t))
+            # Inverse
+            R_inv = p.R.T
+            t_inv = -R_inv @ p.t
+            adj[p.idx2].append((p.idx1, R_inv, t_inv))
+
+        poses = {0: (np.eye(3), np.zeros((3, 1)))}
+        queue = deque([0])
+        visited = {0}
+
+        while queue:
+            curr = queue.popleft()
+            R_curr, t_curr = poses[curr]
+            for neigh, R_rel, t_rel in adj[curr]:
+                if neigh in visited:
+                    continue
+                # Compose: R_neigh = R_rel @ R_curr, t_neigh = R_rel @ t_curr + t_rel
+                R_new = R_rel @ R_curr
+                t_new = R_rel @ t_curr + t_rel
+                poses[neigh] = (R_new, t_new)
+                visited.add(neigh)
+                queue.append(neigh)
+
+        return poses
 
     def triangulate_sparse(
         self,
