@@ -685,10 +685,13 @@ class ImageAligner:
                 colors = result.point_colors
                 for point_id, point in enumerate(result.sparse_points):
                     obs = []
+                    seen_images = set()
                     for image_idx, _, _ in point_observations.get(point_id, []):
                         key = (point_id, image_idx)
-                        if image_idx in image_ids and key in point2d_indices:
+                        if (image_idx in image_ids and key in point2d_indices
+                                and image_idx not in seen_images):
                             obs.append((image_ids[image_idx], point2d_indices[key]))
+                            seen_images.add(image_idx)
                     # COLMAP points need at least two image observations.
                     if len(obs) < 2:
                         continue
