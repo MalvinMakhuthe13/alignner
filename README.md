@@ -13,6 +13,8 @@ Upload photos **or videos**. Videos are automatically turned into frames and the
 - Relative pose estimation
 - Connected components
 - 3D camera position visualization
+- Multi-view feature tracks and sparse point triangulation
+- COLMAP text-model export (registered cameras, image observations, and point tracks)
 - **Video frame extraction** (configurable interval + max frames)
 - Download estimated poses as JSON
 
@@ -43,17 +45,19 @@ streamlit run app.py
 ## Current Limitations
 
 - Approximate shared intrinsics
-- Pairwise relative poses (no full incremental SfM / bundle adjustment yet)
-- No dense reconstruction or meshing
+- Pairwise relative poses; no global pose-graph optimization or true bundle adjustment yet
+- Approximate shared intrinsics; mixed camera models and EXIF calibration are not yet handled
+- Sparse reconstruction only; no dense reconstruction or meshing yet
+- Disconnected components have independent local coordinate systems and cannot be merged without additional constraints
 - No GPS / control points
 
 For production work use RealityScan, COLMAP, or Meshroom.
 
 ## Roadmap
 
-- Incremental structure-from-motion
-- Bundle adjustment
-- COLMAP / RealityScan export
+- Incremental structure-from-motion and global pose optimization
+- True robust bundle adjustment
+- Dense reconstruction and meshing integration
 - Masking support
 - Better video keyframe selection
 
