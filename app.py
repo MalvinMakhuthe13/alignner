@@ -167,39 +167,92 @@ if st.session_state.get("alignment_done") and "alignment_result" in st.session_s
             })
         st.dataframe(rows, use_container_width=True)
 
-    # 3D cameras
-    if result.camera_poses:
-        st.subheader("Estimated Camera Positions")
+    # 3D cameras + sparse points
+    if result.camera_poses or (result.sparse_points is not None):
+        st.subheader("Cameras + Sparse Points")
         fig = go.Figure()
-        positions, labels = [], []
-        for idx, (R, t) in result.camera_poses.items():
-            C = -R.T @ t.flatten()
-            positions.append(C)
-            labels.append(Path(result.features[idx].path).name)
 
-        if positions:
-            pos = np.array(positions)
+        # Cameras
+        if result.camera_poses:
+            positions, labels = [], []
+            for idx, (R, t) in result.camera_poses.items():
+                C = -R.T @ t.flatten()
+                positions.append(C)
+                labels.append(Path(result.features[idx].path).name)
+            if positions:
+                pos = np.array(positions)
+                fig.add_trace(go.Scatter3d(
+                    x=pos[:,0], y=pos[:,1], z=pos[:,2],
+                    mode="markers+text",
+                    text=labels,
+                    textposition="top center",
+                    marker=dict(size=6, color="cyan"),
+                    name="Cameras",
+                ))
+
+        # Sparse points
+        if result.sparse_points is not None and len(result.sparse_points) > 0:
+            pts = result.sparse_points
+            # Subsample for display if huge
+            if len(pts) > 15000:
+                idx = np.random.choice(len(pts), 15000, replace=False)
+                pts = pts[idx]
+                cols = result.point_colors[idx] if result.point_colors is not None else None
+            else:
+                cols = result.point_colors
+
             fig.add_trace(go.Scatter3d(
-                x=pos[:,0], y=pos[:,1], z=pos[:,2],
-                mode="markers+text",
-                text=labels,
-                textposition="top center",
-                marker=dict(size=7, color="cyan"),
-                name="Cameras",
-            ))
-            fig.add_trace(go.Scatter3d(
-                x=[0], y=[0], z=[0],
+                x=pts[:,0], y=pts[:,1], z=pts[:,2],
                 mode="markers",
-                marker=dict(size=10, color="red", symbol="diamond"),
-                name="Origin",
+                marker=dict(
+                    size=2,
+                    color=cols if cols is not None else "orange",
+                    opacity=0.7,
+                ),
+                name="Sparse points",
             ))
-            fig.update_layout(
-                scene=dict(aspectmode="data"),
-                height=520,
-                margin=dict(l=0,r=0,b=0,t=30),
-            )
-            st.plotly_chart(fig, use_container_width=True)
-            st.caption("Relative poses (pairwise). Full bundle adjustment coming later.")
+
+        fig.add_trace(go.Scatter3d(
+            x=[0], y=[0], z=[0],
+            mode="markers",
+            marker=dict(size=8, color="red", symbol="diamond"),
+            name="Origin",
+        ))
+        fig.update_layout(
+            scene=dict(aspectmode="data"),
+            height=560,
+            margin=dict(l=0, r=0, b=0, t=30),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+        npts = 0 if result.sparse_points is None else len(result.sparse_points)
+        st.caption(f"{npts} sparse points triangulated. Inspect coverage before sending to Brush / Gaussian splatting.")
+
+    # COLMAP export
+    if st.button("Export COLMAP dataset"):
+        with st.spinner("Writing COLMAP folder..."):
+            sample = result.features[0]
+            avg = max(sample.width, sample.height)
+            focal = avg * 1.2
+            K = np.array([[focal, 0, sample.width/2], [0, focal, sample.height/2], [0, 0, 1]])
+
+            export_tmp = Path(tempfile.mkdtemp())
+            out_path = str(export_tmp / "colmap_export")
+            aligner = ImageAligner()
+            aligner.export_colmap(result, out_path, K)
+
+            import shutil
+            zip_base = str(export_tmp / "colmap_export")
+            shutil.make_archive(zip_base, "zip", out_path)
+            zip_path = zip_base + ".zip"
+
+            with open(zip_path, "rb") as f:
+                st.download_button(
+                    "Download COLMAP dataset (.zip)",
+                    data=f.read(),
+                    file_name="colmap_export.zip",
+                    mime="application/zip",
+                )
+            st.success("COLMAP export ready (cameras.txt, images.txt, points3D.txt + images/)")
 
     # Sample matches
     if result.pairs:

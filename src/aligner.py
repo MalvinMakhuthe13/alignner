@@ -47,8 +47,11 @@ class MatchPair:
 class AlignmentResult:
     features: List[ImageFeatures]
     pairs: List[MatchPair]
-    components: List[List[int]]  # connected components of aligned images
-    camera_poses: Dict[int, Tuple[np.ndarray, np.ndarray]] = field(default_factory=dict)  # R, t relative to first
+    components: List[List[int]]
+    camera_poses: Dict[int, Tuple[np.ndarray, np.ndarray]] = field(default_factory=dict)
+    sparse_points: Optional[np.ndarray] = None          # Nx3
+    point_colors: Optional[np.ndarray] = None           # Nx3
+    point_tracks: Optional[List] = None                 # list of (point_id, image_id, kp_idx)
 
 
 class ImageAligner:
@@ -294,13 +297,171 @@ class ImageAligner:
         if progress_callback:
             progress_callback(1.0, "Done")
 
+        # Triangulate sparse points
+        sparse_pts, colors, tracks = self.triangulate_sparse(features, pairs, poses, K)
+        logger.info(f"Triangulated {len(sparse_pts) if sparse_pts is not None else 0} sparse points")
+
         logger.info(f"Alignment complete: {len(pairs)} verified pairs, {len(components)} components")
         return AlignmentResult(
             features=features,
             pairs=pairs,
             components=components,
             camera_poses=poses,
+            sparse_points=sparse_pts,
+            point_colors=colors,
+            point_tracks=tracks,
         )
+
+    def triangulate_sparse(
+        self,
+        features: List[ImageFeatures],
+        pairs: List[MatchPair],
+        poses: Dict[int, Tuple[np.ndarray, np.ndarray]],
+        K: np.ndarray,
+        max_points: int = 50000,
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[List]]:
+        """Simple pairwise triangulation of inlier matches that have known poses."""
+        points = []
+        colors = []
+        tracks = []
+        point_id = 0
+
+        for pair in pairs:
+            if pair.idx1 not in poses or pair.idx2 not in poses:
+                continue
+            if len(pair.matches) < 8:
+                continue
+
+            R1, t1 = poses[pair.idx1]
+            R2, t2 = poses[pair.idx2]
+
+            # Projection matrices
+            P1 = K @ np.hstack((R1, t1))
+            P2 = K @ np.hstack((R2, t2))
+
+            pts1 = np.float32([features[pair.idx1].keypoints[m.queryIdx].pt for m in pair.matches]).T
+            pts2 = np.float32([features[pair.idx2].keypoints[m.trainIdx].pt for m in pair.matches]).T
+
+            pts4d = cv2.triangulatePoints(P1, P2, pts1, pts2)
+            pts3d = (pts4d[:3] / pts4d[3]).T
+
+            # Filter reasonable points
+            for i, pt in enumerate(pts3d):
+                if np.any(np.isnan(pt)) or np.any(np.abs(pt) > 1000):
+                    continue
+                points.append(pt)
+                # Color from first image
+                x, y = int(pts1[0, i]), int(pts1[1, i])
+                img = features[pair.idx1].image
+                if img is not None and 0 <= y < img.shape[0] and 0 <= x < img.shape[1]:
+                    colors.append(img[y, x][::-1])  # BGR -> RGB
+                else:
+                    colors.append([128, 128, 128])
+
+                tracks.append((point_id, pair.idx1, pair.matches[i].queryIdx))
+                tracks.append((point_id, pair.idx2, pair.matches[i].trainIdx))
+                point_id += 1
+
+                if len(points) >= max_points:
+                    break
+            if len(points) >= max_points:
+                break
+
+        if not points:
+            return None, None, None
+        return np.array(points), np.array(colors), tracks
+
+    def export_colmap(
+        self,
+        result: AlignmentResult,
+        output_dir: str,
+        K: np.ndarray,
+    ) -> str:
+        """Write a minimal COLMAP-compatible folder (cameras.txt, images.txt, points3D.txt + images)."""
+        out = Path(output_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        images_dir = out / "images"
+        images_dir.mkdir(exist_ok=True)
+
+        # cameras.txt (PINHOLE)
+        with open(out / "cameras.txt", "w") as f:
+            f.write("# Camera list with one line of data per camera:\n")
+            f.write("#   CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n")
+            f.write("# Number of cameras: 1\n")
+            sample = result.features[0]
+            fx, fy, cx, cy = K[0,0], K[1,1], K[0,2], K[1,2]
+            f.write(f"1 PINHOLE {sample.width} {sample.height} {fx} {fy} {cx} {cy}\n")
+
+        # images.txt
+        with open(out / "images.txt", "w") as f:
+            f.write("# Image list with two lines of data per image:\n")
+            f.write("#   IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME\n")
+            f.write("#   POINTS2D[] as (X, Y, POINT3D_ID)\n")
+            f.write(f"# Number of images: {len(result.features)}\n")
+
+            for img_id, feat in enumerate(result.features):
+                name = Path(feat.path).name
+                # Copy / save image
+                if feat.image is not None:
+                    cv2.imwrite(str(images_dir / name), feat.image)
+
+                if img_id in result.camera_poses:
+                    R, t = result.camera_poses[img_id]
+                    # COLMAP uses world-to-camera: R, t where t = -R @ C
+                    q = self.rotmat_to_quat(R)
+                    tx, ty, tz = t.flatten()
+                else:
+                    q = [1, 0, 0, 0]
+                    tx = ty = tz = 0
+
+                f.write(f"{img_id+1} {q[0]} {q[1]} {q[2]} {q[3]} {tx} {ty} {tz} 1 {name}\n")
+                f.write("\n")  # empty POINTS2D line for now
+
+        # points3D.txt
+        with open(out / "points3D.txt", "w") as f:
+            f.write("# 3D point list with one line of data per point:\n")
+            f.write("#   POINT3D_ID, X, Y, Z, R, G, B, ERROR, TRACK[] as (IMAGE_ID, POINT2D_IDX)\n")
+            npts = 0 if result.sparse_points is None else len(result.sparse_points)
+            f.write(f"# Number of points: {npts}\n")
+
+            if result.sparse_points is not None:
+                for pid, (pt, col) in enumerate(zip(result.sparse_points, result.point_colors)):
+                    r, g, b = int(col[0]), int(col[1]), int(col[2])
+                    f.write(f"{pid+1} {pt[0]} {pt[1]} {pt[2]} {r} {g} {b} 0.5\n")
+
+        return str(out)
+
+    @staticmethod
+    def rotmat_to_quat(R: np.ndarray) -> np.ndarray:
+        """Rotation matrix to quaternion (w, x, y, z)."""
+        m = R
+        t = np.trace(m)
+        if t > 0:
+            s = 0.5 / np.sqrt(t + 1.0)
+            w = 0.25 / s
+            x = (m[2,1] - m[1,2]) * s
+            y = (m[0,2] - m[2,0]) * s
+            z = (m[1,0] - m[0,1]) * s
+        else:
+            if m[0,0] > m[1,1] and m[0,0] > m[2,2]:
+                s = 2.0 * np.sqrt(1.0 + m[0,0] - m[1,1] - m[2,2])
+                w = (m[2,1] - m[1,2]) / s
+                x = 0.25 * s
+                y = (m[0,1] + m[1,0]) / s
+                z = (m[0,2] + m[2,0]) / s
+            elif m[1,1] > m[2,2]:
+                s = 2.0 * np.sqrt(1.0 + m[1,1] - m[0,0] - m[2,2])
+                w = (m[0,2] - m[2,0]) / s
+                x = (m[0,1] + m[1,0]) / s
+                y = 0.25 * s
+                z = (m[1,2] + m[2,1]) / s
+            else:
+                s = 2.0 * np.sqrt(1.0 + m[2,2] - m[0,0] - m[1,1])
+                w = (m[1,0] - m[0,1]) / s
+                x = (m[0,2] + m[2,0]) / s
+                y = (m[1,2] + m[2,1]) / s
+                z = 0.25 * s
+        return np.array([w, x, y, z])
 
 
 def visualize_matches(
