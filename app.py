@@ -131,98 +131,111 @@ if st.button("🚀 Align", type="primary"):
             progress_bar.progress(1.0)
             status_text.caption("Finished")
 
-        st.success(f"Done — {len(result.features)} images, {len(result.pairs)} verified pairs")
+        # Persist result so it survives slider changes
+        st.session_state["alignment_result"] = result
+        st.session_state["alignment_done"] = True
 
-        # Metrics
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Images / Frames", len(result.features))
-        c2.metric("Verified Pairs", len(result.pairs))
-        c3.metric("Components", len(result.components))
-        c4.metric("Largest Component", max((len(c) for c in result.components), default=0))
+# ── Display results (persists across reruns) ─────────────────
+if st.session_state.get("alignment_done") and "alignment_result" in st.session_state:
+    result = st.session_state["alignment_result"]
 
-        # Components
-        st.subheader("Connected Components")
-        for i, comp in enumerate(result.components):
-            names = [Path(result.features[j].path).name for j in comp]
-            st.write(f"**Component {i+1}** ({len(comp)}): {', '.join(names[:8])}{'...' if len(names)>8 else ''}")
+    st.success(f"Done — {len(result.features)} images, {len(result.pairs)} verified pairs")
 
-        # Pairs table
-        if result.pairs:
-            st.subheader("Verified Pairs")
-            rows = []
-            for p in sorted(result.pairs, key=lambda x: -x.inliers)[:50]:
-                rows.append({
-                    "A": Path(result.features[p.idx1].path).name,
-                    "B": Path(result.features[p.idx2].path).name,
-                    "Inliers": p.inliers,
-                    "Pose": "✓" if p.R is not None else "—",
-                })
-            st.dataframe(rows, use_container_width=True)
+    # Metrics
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Images / Frames", len(result.features))
+    c2.metric("Verified Pairs", len(result.pairs))
+    c3.metric("Components", len(result.components))
+    c4.metric("Largest Component", max((len(c) for c in result.components), default=0))
 
-        # 3D cameras
-        if result.camera_poses:
-            st.subheader("Estimated Camera Positions")
-            fig = go.Figure()
-            positions, labels = [], []
-            for idx, (R, t) in result.camera_poses.items():
-                C = -R.T @ t.flatten()
-                positions.append(C)
-                labels.append(Path(result.features[idx].path).name)
+    # Components
+    st.subheader("Connected Components")
+    for i, comp in enumerate(result.components):
+        names = [Path(result.features[j].path).name for j in comp]
+        st.write(f"**Component {i+1}** ({len(comp)}): {', '.join(names[:8])}{'...' if len(names)>8 else ''}")
 
-            if positions:
-                pos = np.array(positions)
-                fig.add_trace(go.Scatter3d(
-                    x=pos[:,0], y=pos[:,1], z=pos[:,2],
-                    mode="markers+text",
-                    text=labels,
-                    textposition="top center",
-                    marker=dict(size=7, color="cyan"),
-                    name="Cameras",
-                ))
-                fig.add_trace(go.Scatter3d(
-                    x=[0], y=[0], z=[0],
-                    mode="markers",
-                    marker=dict(size=10, color="red", symbol="diamond"),
-                    name="Origin",
-                ))
-                fig.update_layout(
-                    scene=dict(aspectmode="data"),
-                    height=520,
-                    margin=dict(l=0,r=0,b=0,t=30),
-                )
-                st.plotly_chart(fig, use_container_width=True)
-                st.caption("Relative poses (pairwise). Full bundle adjustment coming later.")
+    # Pairs table
+    if result.pairs:
+        st.subheader("Verified Pairs")
+        rows = []
+        for p in sorted(result.pairs, key=lambda x: -x.inliers)[:50]:
+            rows.append({
+                "A": Path(result.features[p.idx1].path).name,
+                "B": Path(result.features[p.idx2].path).name,
+                "Inliers": p.inliers,
+                "Pose": "✓" if p.R is not None else "—",
+            })
+        st.dataframe(rows, use_container_width=True)
 
-        # Sample matches
-        if result.pairs:
-            st.subheader("Best Matches")
-            best = max(result.pairs, key=lambda p: p.inliers)
-            f1 = result.features[best.idx1]
-            f2 = result.features[best.idx2]
-            if f1.image is not None and f2.image is not None:
-                vis = visualize_matches(f1.image, f1.keypoints, f2.image, f2.keypoints, best.matches, 50)
-                st.image(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB), caption=f"{best.inliers} inliers")
+    # 3D cameras
+    if result.camera_poses:
+        st.subheader("Estimated Camera Positions")
+        fig = go.Figure()
+        positions, labels = [], []
+        for idx, (R, t) in result.camera_poses.items():
+            C = -R.T @ t.flatten()
+            positions.append(C)
+            labels.append(Path(result.features[idx].path).name)
 
-        # Export
-        if result.camera_poses:
-            export = {
-                "num_images": len(result.features),
-                "components": result.components,
-                "poses": {
-                    str(i): {
-                        "R": R.tolist(),
-                        "t": t.flatten().tolist(),
-                        "name": Path(result.features[i].path).name,
-                    }
-                    for i, (R, t) in result.camera_poses.items()
-                }
-            }
-            st.download_button(
-                "Download poses (JSON)",
-                data=json.dumps(export, indent=2),
-                file_name="alignner_poses.json",
-                mime="application/json",
+        if positions:
+            pos = np.array(positions)
+            fig.add_trace(go.Scatter3d(
+                x=pos[:,0], y=pos[:,1], z=pos[:,2],
+                mode="markers+text",
+                text=labels,
+                textposition="top center",
+                marker=dict(size=7, color="cyan"),
+                name="Cameras",
+            ))
+            fig.add_trace(go.Scatter3d(
+                x=[0], y=[0], z=[0],
+                mode="markers",
+                marker=dict(size=10, color="red", symbol="diamond"),
+                name="Origin",
+            ))
+            fig.update_layout(
+                scene=dict(aspectmode="data"),
+                height=520,
+                margin=dict(l=0,r=0,b=0,t=30),
             )
+            st.plotly_chart(fig, use_container_width=True)
+            st.caption("Relative poses (pairwise). Full bundle adjustment coming later.")
+
+    # Sample matches
+    if result.pairs:
+        st.subheader("Best Matches")
+        best = max(result.pairs, key=lambda p: p.inliers)
+        f1 = result.features[best.idx1]
+        f2 = result.features[best.idx2]
+        if f1.image is not None and f2.image is not None:
+            vis = visualize_matches(f1.image, f1.keypoints, f2.image, f2.keypoints, best.matches, 50)
+            st.image(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB), caption=f"{best.inliers} inliers")
+
+    # Export
+    if result.camera_poses:
+        export = {
+            "num_images": len(result.features),
+            "components": result.components,
+            "poses": {
+                str(i): {
+                    "R": R.tolist(),
+                    "t": t.flatten().tolist(),
+                    "name": Path(result.features[i].path).name,
+                }
+                for i, (R, t) in result.camera_poses.items()
+            }
+        }
+        st.download_button(
+            "Download poses (JSON)",
+            data=json.dumps(export, indent=2),
+            file_name="alignner_poses.json",
+            mime="application/json",
+        )
+
+    if st.button("Clear results"):
+        st.session_state.pop("alignment_result", None)
+        st.session_state.pop("alignment_done", None)
+        st.rerun()
 
 st.markdown("---")
 st.caption("Alignner prototype • Video frames are extracted locally • Full SfM / COLMAP export planned")
