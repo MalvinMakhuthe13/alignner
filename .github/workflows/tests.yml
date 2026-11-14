@@ -1,4 +1,4 @@
-name: Alignner tests
+name: Alignner regression tests
 
 on:
   push:
