@@ -426,37 +426,40 @@ class ImageAligner:
         return refined_poses, refined_pts
 
     def propagate_poses(self, pairs: List[MatchPair], n: int) -> Dict[int, Tuple[np.ndarray, np.ndarray]]:
-        """Chain relative poses from image 0 across the whole connected component."""
+        """Propagate poses independently through every connected camera component.
+
+        Each component receives its own identity reference camera. Coordinates
+        between disconnected components are therefore local and must not be
+        interpreted as sharing a common world frame.
+        """
         from collections import defaultdict, deque
 
-        # Build adjacency with relative transforms
         adj = defaultdict(list)
-        for p in pairs:
-            if p.R is None or p.t is None:
+        for pair in pairs:
+            if pair.R is None or pair.t is None:
                 continue
-            # Store both directions
-            adj[p.idx1].append((p.idx2, p.R, p.t))
-            # Inverse
-            R_inv = p.R.T
-            t_inv = -R_inv @ p.t
-            adj[p.idx2].append((p.idx1, R_inv, t_inv))
+            if not (0 <= pair.idx1 < n and 0 <= pair.idx2 < n):
+                continue
+            R_rel = np.asarray(pair.R, dtype=np.float64).reshape(3, 3)
+            t_rel = np.asarray(pair.t, dtype=np.float64).reshape(3, 1)
+            adj[pair.idx1].append((pair.idx2, R_rel, t_rel))
+            R_inv = R_rel.T
+            adj[pair.idx2].append((pair.idx1, R_inv, -R_inv @ t_rel))
 
-        poses = {0: (np.eye(3), np.zeros((3, 1)))}
-        queue = deque([0])
-        visited = {0}
-
-        while queue:
-            curr = queue.popleft()
-            R_curr, t_curr = poses[curr]
-            for neigh, R_rel, t_rel in adj[curr]:
-                if neigh in visited:
-                    continue
-                # Compose: R_neigh = R_rel @ R_curr, t_neigh = R_rel @ t_curr + t_rel
-                R_new = R_rel @ R_curr
-                t_new = R_rel @ t_curr + t_rel
-                poses[neigh] = (R_new, t_new)
-                visited.add(neigh)
-                queue.append(neigh)
+        poses: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
+        for root in range(n):
+            if root in poses:
+                continue
+            poses[root] = (np.eye(3, dtype=np.float64), np.zeros((3, 1), dtype=np.float64))
+            queue = deque([root])
+            while queue:
+                curr = queue.popleft()
+                R_curr, t_curr = poses[curr]
+                for neigh, R_rel, t_rel in adj[curr]:
+                    if neigh in poses:
+                        continue
+                    poses[neigh] = (R_rel @ R_curr, R_rel @ t_curr + t_rel)
+                    queue.append(neigh)
 
         return poses
 
