@@ -503,7 +503,7 @@ class ImageAligner:
 
         poses: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
         for root in range(n):
-            if root in poses:
+            if root in poses or not adj[root]:
                 continue
             poses[root] = (np.eye(3, dtype=np.float64), np.zeros((3, 1), dtype=np.float64))
             queue = deque([root])
