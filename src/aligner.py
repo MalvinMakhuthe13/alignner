@@ -631,12 +631,18 @@ class ImageAligner:
                 uv = result.features[image_idx].keypoints[keypoint_idx].pt
                 point_observations.setdefault(int(point_id), []).append((image_idx, int(keypoint_idx), uv))
 
+        # Keep only points observed in at least two registered images.
+        valid_point_ids = {
+            point_id for point_id, observations in point_observations.items()
+            if len({obs[0] for obs in observations if obs[0] in image_ids}) >= 2
+        }
+
         # Remove duplicate observations and assign stable per-image 2D indices.
         point2d_indices = {}
         for image_idx in registered:
             seen_keypoints = set()
             entries = []
-            for point_id in sorted(point_observations):
+            for point_id in sorted(valid_point_ids):
                 for obs_image, keypoint_idx, uv in point_observations[point_id]:
                     if obs_image != image_idx or keypoint_idx in seen_keypoints:
                         continue
