@@ -583,57 +583,115 @@ class ImageAligner:
         output_dir: str,
         K: np.ndarray,
     ) -> str:
-        """Write a minimal COLMAP-compatible folder (cameras.txt, images.txt, points3D.txt + images)."""
+        """Export a text sparse model with consistent image observations and point tracks.
+
+        Only registered images (those with estimated poses) are written. The
+        model is a valid COLMAP text-model layout, but its camera/intrinsic
+        estimates remain those produced by this prototype.
+        """
+        if not result.features:
+            raise ValueError("Cannot export an empty alignment result.")
+
         out = Path(output_dir)
         out.mkdir(parents=True, exist_ok=True)
         images_dir = out / "images"
         images_dir.mkdir(exist_ok=True)
 
-        # cameras.txt (PINHOLE)
-        with open(out / "cameras.txt", "w") as f:
+        registered = sorted(idx for idx in result.camera_poses if 0 <= idx < len(result.features))
+        if not registered:
+            raise ValueError("No registered camera poses are available for COLMAP export.")
+
+        # COLMAP image IDs are positive integers and independent of source indices.
+        image_ids = {idx: position + 1 for position, idx in enumerate(registered)}
+        image_names = {}
+        used_names = set()
+        for idx in registered:
+            source_name = Path(result.features[idx].path).name
+            name = source_name
+            if name in used_names:
+                name = f"{idx:06d}_{source_name}"
+            used_names.add(name)
+            image_names[idx] = name
+            image = result.features[idx].image
+            if image is not None and not cv2.imwrite(str(images_dir / name), image):
+                raise IOError(f"Could not write exported image: {name}")
+
+        # Each image's POINTS2D list is built once. The index in this list is
+        # exactly the POINT2D_IDX referenced by points3D.txt.
+        image_observations = {idx: [] for idx in registered}
+        point_observations = {}
+        if result.point_tracks:
+            for point_id, image_idx, keypoint_idx in result.point_tracks:
+                if image_idx not in image_ids or point_id < 0:
+                    continue
+                if point_id >= (0 if result.sparse_points is None else len(result.sparse_points)):
+                    continue
+                if keypoint_idx < 0 or keypoint_idx >= len(result.features[image_idx].keypoints):
+                    continue
+                uv = result.features[image_idx].keypoints[keypoint_idx].pt
+                point_observations.setdefault(int(point_id), []).append((image_idx, int(keypoint_idx), uv))
+
+        # Remove duplicate observations and assign stable per-image 2D indices.
+        point2d_indices = {}
+        for image_idx in registered:
+            seen_keypoints = set()
+            entries = []
+            for point_id in sorted(point_observations):
+                for obs_image, keypoint_idx, uv in point_observations[point_id]:
+                    if obs_image != image_idx or keypoint_idx in seen_keypoints:
+                        continue
+                    seen_keypoints.add(keypoint_idx)
+                    point2d_idx = len(entries)
+                    entries.append((float(uv[0]), float(uv[1]), point_id))
+                    point2d_indices[(point_id, image_idx)] = point2d_idx
+            image_observations[image_idx] = entries
+
+        sample = result.features[registered[0]]
+        fx, fy, cx, cy = (float(K[0, 0]), float(K[1, 1]), float(K[0, 2]), float(K[1, 2]))
+        with open(out / "cameras.txt", "w", encoding="utf-8") as f:
             f.write("# Camera list with one line of data per camera:\n")
-            f.write("#   CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n")
-            f.write("# Number of cameras: 1\n")
-            sample = result.features[0]
-            fx, fy, cx, cy = K[0,0], K[1,1], K[0,2], K[1,2]
-            f.write(f"1 PINHOLE {sample.width} {sample.height} {fx} {fy} {cx} {cy}\n")
+            f.write("# CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n")
+            f.write("1 PINHOLE {} {} {:.12g} {:.12g} {:.12g} {:.12g}\n".format(
+                sample.width, sample.height, fx, fy, cx, cy
+            ))
 
-        # images.txt
-        with open(out / "images.txt", "w") as f:
+        with open(out / "images.txt", "w", encoding="utf-8") as f:
             f.write("# Image list with two lines of data per image:\n")
-            f.write("#   IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME\n")
-            f.write("#   POINTS2D[] as (X, Y, POINT3D_ID)\n")
-            f.write(f"# Number of images: {len(result.features)}\n")
+            f.write("# IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME\n")
+            f.write("# POINTS2D[] as (X, Y, POINT3D_ID)\n")
+            for idx in registered:
+                R, t = result.camera_poses[idx]
+                q = self.rotmat_to_quat(np.asarray(R, dtype=np.float64))
+                tx, ty, tz = np.asarray(t).reshape(3)
+                f.write("{} {:.12g} {:.12g} {:.12g} {:.12g} {:.12g} {:.12g} {:.12g} 1 {}\n".format(
+                    image_ids[idx], *q, tx, ty, tz, image_names[idx]
+                ))
+                entries = image_observations[idx]
+                f.write(" ".join(
+                    "{:.6f} {:.6f} {}".format(x, y, point_id + 1)
+                    for x, y, point_id in entries
+                ) + "\n")
 
-            for img_id, feat in enumerate(result.features):
-                name = Path(feat.path).name
-                # Copy / save image
-                if feat.image is not None:
-                    cv2.imwrite(str(images_dir / name), feat.image)
-
-                if img_id in result.camera_poses:
-                    R, t = result.camera_poses[img_id]
-                    # COLMAP uses world-to-camera: R, t where t = -R @ C
-                    q = self.rotmat_to_quat(R)
-                    tx, ty, tz = t.flatten()
-                else:
-                    q = [1, 0, 0, 0]
-                    tx = ty = tz = 0
-
-                f.write(f"{img_id+1} {q[0]} {q[1]} {q[2]} {q[3]} {tx} {ty} {tz} 1 {name}\n")
-                f.write("\n")  # empty POINTS2D line for now
-
-        # points3D.txt
-        with open(out / "points3D.txt", "w") as f:
+        with open(out / "points3D.txt", "w", encoding="utf-8") as f:
             f.write("# 3D point list with one line of data per point:\n")
-            f.write("#   POINT3D_ID, X, Y, Z, R, G, B, ERROR, TRACK[] as (IMAGE_ID, POINT2D_IDX)\n")
-            npts = 0 if result.sparse_points is None else len(result.sparse_points)
-            f.write(f"# Number of points: {npts}\n")
-
+            f.write("# POINT3D_ID, X, Y, Z, R, G, B, ERROR, TRACK[]\n")
             if result.sparse_points is not None:
-                for pid, (pt, col) in enumerate(zip(result.sparse_points, result.point_colors)):
-                    r, g, b = int(col[0]), int(col[1]), int(col[2])
-                    f.write(f"{pid+1} {pt[0]} {pt[1]} {pt[2]} {r} {g} {b} 0.5\n")
+                colors = result.point_colors
+                for point_id, point in enumerate(result.sparse_points):
+                    obs = []
+                    for image_idx, _, _ in point_observations.get(point_id, []):
+                        key = (point_id, image_idx)
+                        if image_idx in image_ids and key in point2d_indices:
+                            obs.append((image_ids[image_idx], point2d_indices[key]))
+                    # COLMAP points need at least two image observations.
+                    if len(obs) < 2:
+                        continue
+                    color = colors[point_id] if colors is not None and point_id < len(colors) else [128, 128, 128]
+                    r, g, b = [int(np.clip(v, 0, 255)) for v in color]
+                    track_text = " ".join(f"{image_id} {point2d_idx}" for image_id, point2d_idx in obs)
+                    f.write("{:d} {:.12g} {:.12g} {:.12g} {:d} {:d} {:d} 0 {}".format(
+                        point_id + 1, point[0], point[1], point[2], r, g, b, track_text
+                    ) + "\n")
 
         return str(out)
 
