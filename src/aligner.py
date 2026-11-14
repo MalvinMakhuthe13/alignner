@@ -219,18 +219,18 @@ class ImageAligner:
             # Full pairwise for small sets
             candidate_pairs = [(i, j) for i in range(n) for j in range(i + 1, n)]
         else:
-            # Smart mode: nearby images + sparse long-range links
+            # Smart mode: denser nearby + more long-range links for whole-object coverage
             candidate_pairs = []
+            window = max(max_neighbors, 18)  # denser for better coverage
             for i in range(n):
-                # Nearby
-                for d in range(1, max_neighbors + 1):
+                for d in range(1, window + 1):
                     j = i + d
                     if j < n:
                         candidate_pairs.append((i, j))
-                # Occasional longer jump to help connectivity
-                if i % 8 == 0:
-                    for d in range(max_neighbors + 1, min(max_neighbors * 3, n - i)):
-                        if d % 3 == 0:
+                # Extra longer jumps every few images
+                if i % 5 == 0:
+                    for d in range(window + 1, min(window * 4, n - i)):
+                        if d % 4 == 0:
                             candidate_pairs.append((i, i + d))
 
         total_pairs = len(candidate_pairs)

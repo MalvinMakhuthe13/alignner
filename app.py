@@ -154,18 +154,31 @@ if st.session_state.get("alignment_done") and "alignment_result" in st.session_s
         names = [Path(result.features[j].path).name for j in comp]
         st.write(f"**Component {i+1}** ({len(comp)}): {', '.join(names[:8])}{'...' if len(names)>8 else ''}")
 
-    # Pairs table
+    # Match browser
     if result.pairs:
-        st.subheader("Verified Pairs")
-        rows = []
-        for p in sorted(result.pairs, key=lambda x: -x.inliers)[:50]:
-            rows.append({
-                "A": Path(result.features[p.idx1].path).name,
-                "B": Path(result.features[p.idx2].path).name,
-                "Inliers": p.inliers,
-                "Pose": "✓" if p.R is not None else "—",
-            })
-        st.dataframe(rows, use_container_width=True)
+        st.subheader("Browse Matches")
+        pair_options = []
+        for i, p in enumerate(sorted(result.pairs, key=lambda x: -x.inliers)):
+            name1 = Path(result.features[p.idx1].path).name
+            name2 = Path(result.features[p.idx2].path).name
+            pair_options.append(f"{name1}  ↔  {name2}  ({p.inliers} inliers)")
+
+        selected_pair = st.selectbox("Select a matched pair", pair_options, index=0)
+        pair_idx = pair_options.index(selected_pair)
+        best_pairs = sorted(result.pairs, key=lambda x: -x.inliers)
+        chosen = best_pairs[pair_idx]
+
+        f1 = result.features[chosen.idx1]
+        f2 = result.features[chosen.idx2]
+        if f1.image is not None and f2.image is not None:
+            vis = visualize_matches(
+                f1.image, f1.keypoints,
+                f2.image, f2.keypoints,
+                chosen.matches,
+                max_draw=80,
+            )
+            st.image(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB), caption=f"{chosen.inliers} inliers", use_container_width=True)
+            st.caption("Green lines = verified matches. Use the dropdown to step through different pairs.")
 
     # 3D cameras + sparse points
     if result.camera_poses or (result.sparse_points is not None):
