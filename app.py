@@ -169,11 +169,13 @@ if st.session_state.get("alignment_done") and "alignment_result" in st.session_s
 
         col_prev, col_sel, col_next = st.columns([1, 6, 1])
         with col_prev:
-            if st.button("← Prev") and st.session_state.match_idx > 0:
-                st.session_state.match_idx -= 1
+            if st.button("← Prev", disabled=st.session_state.match_idx <= 0):
+                st.session_state.match_idx = max(0, st.session_state.match_idx - 1)
+                st.rerun()
         with col_next:
-            if st.button("Next →") and st.session_state.match_idx < len(pair_options) - 1:
-                st.session_state.match_idx += 1
+            if st.button("Next →", disabled=st.session_state.match_idx >= len(pair_options) - 1):
+                st.session_state.match_idx = min(len(pair_options) - 1, st.session_state.match_idx + 1)
+                st.rerun()
         with col_sel:
             selected_pair = st.selectbox(
                 "Select a matched pair",
@@ -181,7 +183,10 @@ if st.session_state.get("alignment_done") and "alignment_result" in st.session_s
                 index=st.session_state.match_idx,
                 key="pair_select",
             )
-            st.session_state.match_idx = pair_options.index(selected_pair)
+            new_idx = pair_options.index(selected_pair)
+            if new_idx != st.session_state.match_idx:
+                st.session_state.match_idx = new_idx
+                st.rerun()
 
         chosen = sorted_pairs[st.session_state.match_idx]
         f1 = result.features[chosen.idx1]

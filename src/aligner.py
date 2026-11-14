@@ -334,7 +334,7 @@ class ImageAligner:
         poses: Dict[int, Tuple[np.ndarray, np.ndarray]],
         K: np.ndarray,
         max_points: int = 40000,
-        reproj_thresh: float = 4.0,
+        reproj_thresh: float = 2.5,
     ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[List]]:
         """Triangulate and keep points seen in ≥2 views with low reprojection error."""
         from collections import defaultdict
@@ -359,18 +359,20 @@ class ImageAligner:
             pts3d = (pts4d[:3] / (pts4d[3] + 1e-8)).T
 
             for i, pt in enumerate(pts3d):
-                if np.any(np.isnan(pt)) or np.linalg.norm(pt) > 500:
+                if np.any(np.isnan(pt)) or np.linalg.norm(pt) > 50:
                     continue
 
-                # Reprojection check
+                # Reprojection check (tighter)
                 def reproj(P, pt3, uv):
                     p = P @ np.append(pt3, 1)
-                    p = p[:2] / (p[2] + 1e-8)
+                    if abs(p[2]) < 1e-6:
+                        return 999
+                    p = p[:2] / p[2]
                     return np.linalg.norm(p - uv)
 
                 err1 = reproj(P1, pt, pts1[:, i])
                 err2 = reproj(P2, pt, pts2[:, i])
-                if err1 > reproj_thresh or err2 > reproj_thresh:
+                if err1 > 2.5 or err2 > 2.5:
                     continue
 
                 points.append(pt)
