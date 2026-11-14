@@ -1,71 +1,61 @@
 # Alignner
 
-**Image Alignment for Photogrammetry**
+**Image & Video Alignment for Photogrammetry**
 
-A prototype application for multi-view image alignment, inspired by the alignment stage in [RealityScan](https://www.realityscan.com/) (formerly RealityCapture) by Epic Games.
+Prototype inspired by the alignment stage in [RealityScan](https://www.realityscan.com/) (formerly RealityCapture).
 
-## What it does
+Upload photos **or videos**. Videos are automatically turned into frames and then aligned.
 
-- Detects features (ORB or SIFT) across uploaded images
-- Performs robust pairwise matching with Lowe’s ratio test
-- Verifies geometry with RANSAC (Fundamental / Essential matrix)
-- Estimates relative camera poses
-- Builds a connectivity graph and reports connected components
-- Visualizes approximate camera positions in 3D
-- Shows match quality and feature statistics
+## Features
+
+- Feature detection (ORB / SIFT)
+- Robust matching + RANSAC geometric verification
+- Relative pose estimation
+- Connected components
+- 3D camera position visualization
+- **Video frame extraction** (configurable interval + max frames)
+- Download estimated poses as JSON
 
 ## Quick Start
 
 ```bash
-# Clone
 git clone https://github.com/MalvinMakhuthe13/alignner.git
 cd alignner
 
-# Install
 python -m venv .venv
-source .venv/bin/activate          # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
+# Windows
+.venv\Scripts\activate
+# macOS/Linux
+source .venv/bin/activate
 
-# Run the app
+pip install -r requirements.txt
 streamlit run app.py
 ```
 
-Open the URL shown in the terminal (usually http://localhost:8501).
-
 ## Usage
 
-1. Upload 2 or more overlapping photographs of the same scene/object.
-2. Adjust feature detector, max features, and inlier thresholds in the sidebar.
-3. Click **Align Images**.
-4. Review:
-   - Number of verified pairs and components
-   - Estimated camera positions
-   - Sample match visualization
-   - Feature counts per image
+1. Open the app in your browser.
+2. Upload images **or** videos (or both).
+3. Adjust frame extraction rate in the sidebar for videos.
+4. Click **Align**.
+5. Review pairs, components, camera plot, and download poses.
 
 ## Current Limitations
 
-This is an early prototype:
+- Approximate shared intrinsics
+- Pairwise relative poses (no full incremental SfM / bundle adjustment yet)
+- No dense reconstruction or meshing
+- No GPS / control points
 
-- Uses a single approximate intrinsic matrix for all images
-- Poses are pairwise relative (no full incremental SfM or global bundle adjustment yet)
-- No dense reconstruction, meshing, or texturing
-- No support for GPS/RTK, control points, or multi-camera calibration
+For production work use RealityScan, COLMAP, or Meshroom.
 
-For production-quality alignment and full photogrammetry pipelines, use:
-
-- [RealityScan](https://www.realityscan.com/) (desktop + mobile)
-- [COLMAP](https://colmap.github.io/)
-- Meshroom / AliceVision
-
-## Roadmap ideas
+## Roadmap
 
 - Incremental structure-from-motion
-- Bundle adjustment (e.g. via g2o / Ceres bindings or scipy)
-- Per-image intrinsic estimation
-- Export to COLMAP / RealityScan compatible formats
-- Masking support (AI or manual)
-- Integration with the broader FUMOCA / image_create ecosystem
+- Bundle adjustment
+- COLMAP / RealityScan export
+- Masking support
+- Better video keyframe selection
 
 ## License
 

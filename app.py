@@ -1,6 +1,7 @@
 """
-Alignner App - Image Alignment UI
-Similar in spirit to the Alignment step in RealityScan / RealityCapture.
+Alignner App - Image & Video Alignment UI
+Inspired by RealityScan / RealityCapture alignment.
+Supports images + video frame extraction.
 """
 
 import streamlit as st
@@ -8,48 +9,104 @@ import numpy as np
 import cv2
 from pathlib import Path
 import tempfile
+import json
 import plotly.graph_objects as go
 from src.aligner import ImageAligner, visualize_matches
 
 st.set_page_config(
-    page_title="Alignner - Image Alignment",
+    page_title="Alignner",
     page_icon="📷",
     layout="wide",
 )
 
 st.title("📷 Alignner")
 st.markdown("""
-**Image Alignment for Photogrammetry**  
-Inspired by RealityScan's alignment pipeline. Upload overlapping photos of a scene or object to estimate relative camera poses and connectivity.
+**Image & Video Alignment for Photogrammetry**  
+Upload photos **or videos**. Videos are automatically sampled into frames, then aligned like RealityScan.
 """)
 
-# Sidebar settings
-st.sidebar.header("Alignment Settings")
-detector = st.sidebar.selectbox("Feature Detector", ["orb", "sift"], index=0)
-max_features = st.sidebar.slider("Max Features per Image", 1000, 10000, 4000, step=500)
-match_ratio = st.sidebar.slider("Lowe's Ratio", 0.5, 0.95, 0.75, step=0.05)
-min_inliers = st.sidebar.slider("Min Inliers for Pair", 10, 100, 20)
-focal_override = st.sidebar.number_input(
-    "Focal Length (px, 0 = auto)", value=0.0, min_value=0.0, step=10.0
-)
+# ── Sidebar ──────────────────────────────────────────────
+st.sidebar.header("Settings")
 
-uploaded = st.file_uploader(
-    "Upload images (JPG/PNG)",
+detector = st.sidebar.selectbox("Feature Detector", ["orb", "sift"], index=0)
+max_features = st.sidebar.slider("Max Features / Image", 1000, 12000, 5000, step=500)
+match_ratio = st.sidebar.slider("Lowe's Ratio", 0.5, 0.9, 0.75, 0.05)
+min_inliers = st.sidebar.slider("Min Inliers", 8, 80, 15)
+focal_override = st.sidebar.number_input("Focal Length (px, 0=auto)", 0.0, step=50.0)
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("Video Frame Extraction")
+fps_extract = st.sidebar.slider("Extract every Nth frame (or FPS)", 1, 30, 5)
+max_frames = st.sidebar.slider("Max frames per video", 10, 200, 60)
+
+# ── Input ────────────────────────────────────────────────
+tab1, tab2 = st.tabs(["Images", "Videos"])
+
+image_files = tab1.file_uploader(
+    "Upload images",
     type=["jpg", "jpeg", "png", "webp"],
     accept_multiple_files=True,
 )
 
-if uploaded and len(uploaded) >= 2:
-    if st.button("🚀 Align Images", type="primary"):
-        with st.spinner("Extracting features and aligning..."):
-            # Save uploads to temp
-            tmpdir = tempfile.mkdtemp()
-            paths = []
-            for f in uploaded:
-                p = Path(tmpdir) / f.name
-                p.write_bytes(f.getvalue())
-                paths.append(str(p))
+video_files = tab2.file_uploader(
+    "Upload videos",
+    type=["mp4", "mov", "avi", "mkv", "webm"],
+    accept_multiple_files=True,
+)
 
+def extract_frames(video_bytes: bytes, filename: str, every_n: int, max_n: int, tmpdir: Path):
+    """Extract frames from video bytes."""
+    video_path = tmpdir / filename
+    video_path.write_bytes(video_bytes)
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        st.error(f"Could not open video: {filename}")
+        return []
+
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30
+    st.info(f"{filename}: {total} frames @ {fps:.1f} fps → extracting ~every {every_n} frames")
+
+    frames = []
+    idx = 0
+    saved = 0
+    while saved < max_n:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        if idx % every_n == 0:
+            out_path = tmpdir / f"{Path(filename).stem}_frame_{saved:04d}.jpg"
+            cv2.imwrite(str(out_path), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+            frames.append(str(out_path))
+            saved += 1
+        idx += 1
+    cap.release()
+    return frames
+
+# ── Run ──────────────────────────────────────────────────
+all_paths = []
+tmpdir = Path(tempfile.mkdtemp())
+
+if st.button("🚀 Align", type="primary"):
+    with st.spinner("Preparing images..."):
+        # Images
+        if image_files:
+            for f in image_files:
+                p = tmpdir / f.name
+                p.write_bytes(f.getvalue())
+                all_paths.append(str(p))
+
+        # Videos → frames
+        if video_files:
+            for vf in video_files:
+                frames = extract_frames(vf.getvalue(), vf.name, fps_extract, max_frames, tmpdir)
+                all_paths.extend(frames)
+
+    if len(all_paths) < 2:
+        st.error("Need at least 2 images/frames to align.")
+    else:
+        with st.spinner(f"Aligning {len(all_paths)} images/frames..."):
             aligner = ImageAligner(
                 feature_detector=detector,
                 max_features=max_features,
@@ -57,49 +114,42 @@ if uploaded and len(uploaded) >= 2:
                 min_inliers=min_inliers,
             )
             focal = float(focal_override) if focal_override > 0 else None
-            result = aligner.align(paths, focal_length=focal)
+            result = aligner.align(all_paths, focal_length=focal)
 
-        st.success("Alignment finished!")
+        st.success(f"Done — {len(result.features)} images, {len(result.pairs)} verified pairs")
 
-        # Summary metrics
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Images", len(result.features))
-        col2.metric("Verified Pairs", len(result.pairs))
-        col3.metric("Components", len(result.components))
-        largest = max((len(c) for c in result.components), default=0)
-        col4.metric("Largest Component", largest)
+        # Metrics
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Images / Frames", len(result.features))
+        c2.metric("Verified Pairs", len(result.pairs))
+        c3.metric("Components", len(result.components))
+        c4.metric("Largest Component", max((len(c) for c in result.components), default=0))
 
         # Components
         st.subheader("Connected Components")
         for i, comp in enumerate(result.components):
             names = [Path(result.features[j].path).name for j in comp]
-            st.write(f"**Component {i+1}** ({len(comp)} images): {', '.join(names)}")
+            st.write(f"**Component {i+1}** ({len(comp)}): {', '.join(names[:8])}{'...' if len(names)>8 else ''}")
 
-        # Pair table
+        # Pairs table
         if result.pairs:
-            st.subheader("Verified Image Pairs")
-            pair_data = []
-            for p in sorted(result.pairs, key=lambda x: -x.inliers):
-                name1 = Path(result.features[p.idx1].path).name
-                name2 = Path(result.features[p.idx2].path).name
-                pair_data.append({
-                    "Image A": name1,
-                    "Image B": name2,
+            st.subheader("Verified Pairs")
+            rows = []
+            for p in sorted(result.pairs, key=lambda x: -x.inliers)[:50]:
+                rows.append({
+                    "A": Path(result.features[p.idx1].path).name,
+                    "B": Path(result.features[p.idx2].path).name,
                     "Inliers": p.inliers,
-                    "Has Pose": p.R is not None,
+                    "Pose": "✓" if p.R is not None else "—",
                 })
-            st.dataframe(pair_data, use_container_width=True)
+            st.dataframe(rows, use_container_width=True)
 
-        # Camera visualization (simple 3D)
+        # 3D cameras
         if result.camera_poses:
-            st.subheader("Estimated Camera Positions (relative)")
+            st.subheader("Estimated Camera Positions")
             fig = go.Figure()
-
-            # Camera centers (approximate from R,t — note: t is translation of second relative to first)
-            positions = []
-            labels = []
+            positions, labels = [], []
             for idx, (R, t) in result.camera_poses.items():
-                # Camera center in world (approx): C = -R^T @ t
                 C = -R.T @ t.flatten()
                 positions.append(C)
                 labels.append(Path(result.features[idx].path).name)
@@ -107,59 +157,57 @@ if uploaded and len(uploaded) >= 2:
             if positions:
                 pos = np.array(positions)
                 fig.add_trace(go.Scatter3d(
-                    x=pos[:, 0], y=pos[:, 1], z=pos[:, 2],
+                    x=pos[:,0], y=pos[:,1], z=pos[:,2],
                     mode="markers+text",
                     text=labels,
-                    marker=dict(size=8, color="cyan"),
+                    textposition="top center",
+                    marker=dict(size=7, color="cyan"),
                     name="Cameras",
                 ))
-
-                # Origin
                 fig.add_trace(go.Scatter3d(
                     x=[0], y=[0], z=[0],
                     mode="markers",
-                    marker=dict(size=10, color="red"),
-                    name="Origin (first image)",
+                    marker=dict(size=10, color="red", symbol="diamond"),
+                    name="Origin",
                 ))
-
                 fig.update_layout(
-                    scene=dict(
-                        xaxis_title="X",
-                        yaxis_title="Y",
-                        zaxis_title="Z",
-                        aspectmode="data",
-                    ),
-                    height=500,
-                    margin=dict(l=0, r=0, b=0, t=30),
+                    scene=dict(aspectmode="data"),
+                    height=520,
+                    margin=dict(l=0,r=0,b=0,t=30),
                 )
                 st.plotly_chart(fig, use_container_width=True)
-                st.caption("Note: Positions are relative and approximate (pairwise poses). Full bundle adjustment not yet implemented.")
+                st.caption("Relative poses (pairwise). Full bundle adjustment coming later.")
 
-        # Show sample matches
+        # Sample matches
         if result.pairs:
-            st.subheader("Sample Matches")
+            st.subheader("Best Matches")
             best = max(result.pairs, key=lambda p: p.inliers)
             f1 = result.features[best.idx1]
             f2 = result.features[best.idx2]
             if f1.image is not None and f2.image is not None:
-                vis = visualize_matches(
-                    f1.image, f1.keypoints,
-                    f2.image, f2.keypoints,
-                    best.matches,
-                    max_draw=40,
-                )
-                st.image(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB), caption=f"Best pair: {best.inliers} inliers")
+                vis = visualize_matches(f1.image, f1.keypoints, f2.image, f2.keypoints, best.matches, 50)
+                st.image(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB), caption=f"{best.inliers} inliers")
 
-        # Feature counts
-        st.subheader("Feature Detection")
-        feat_rows = [
-            {"Image": Path(f.path).name, "Features": len(f.keypoints), "Size": f"{f.width}x{f.height}"}
-            for f in result.features
-        ]
-        st.dataframe(feat_rows, use_container_width=True)
-
-else:
-    st.info("Upload at least 2 overlapping images to begin alignment.")
+        # Export
+        if result.camera_poses:
+            export = {
+                "num_images": len(result.features),
+                "components": result.components,
+                "poses": {
+                    str(i): {
+                        "R": R.tolist(),
+                        "t": t.flatten().tolist(),
+                        "name": Path(result.features[i].path).name,
+                    }
+                    for i, (R, t) in result.camera_poses.items()
+                }
+            }
+            st.download_button(
+                "Download poses (JSON)",
+                data=json.dumps(export, indent=2),
+                file_name="alignner_poses.json",
+                mime="application/json",
+            )
 
 st.markdown("---")
-st.caption("Alignner is a learning / prototyping tool. For production photogrammetry use RealityScan, COLMAP, or Meshroom.")
+st.caption("Alignner prototype • Video frames are extracted locally • Full SfM / COLMAP export planned")
