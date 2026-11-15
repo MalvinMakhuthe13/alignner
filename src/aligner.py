@@ -155,23 +155,69 @@ class ImageAligner:
         kp2: List[cv2.KeyPoint],
         matches: List[cv2.DMatch],
         K: np.ndarray,
-    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], int]:
-        """Recover R, t from essential matrix."""
+    ) -> Tuple[
+        Optional[np.ndarray],
+        Optional[np.ndarray],
+        int,
+        List[cv2.DMatch],
+        Optional[np.ndarray],
+    ]:
+        """Recover a validated pose and return its exact verified matches."""
         if len(matches) < 8:
-            return None, None, 0
+            return None, None, 0, [], None
 
-        pts1 = np.float32([kp1[m.queryIdx].pt for m in matches])
-        pts2 = np.float32([kp2[m.trainIdx].pt for m in matches])
+        pts1 = np.float64([kp1[m.queryIdx].pt for m in matches])
+        pts2 = np.float64([kp2[m.trainIdx].pt for m in matches])
 
-        E, mask = cv2.findEssentialMat(
-            pts1, pts2, K, method=cv2.RANSAC, prob=0.999, threshold=1.0
-        )
-        if E is None:
-            return None, None, 0
+        try:
+            E, mask = cv2.findEssentialMat(
+                pts1,
+                pts2,
+                K,
+                method=cv2.RANSAC,
+                prob=0.999,
+                threshold=self.ransac_thresh,
+            )
 
-        _, R, t, pose_mask = cv2.recoverPose(E, pts1, pts2, K)
-        inliers = int(np.sum(pose_mask)) if pose_mask is not None else 0
-        return R, t, inliers
+            if E is None or mask is None:
+                return None, None, 0, [], None
+
+            # OpenCV may return multiple stacked 3x3 essential matrices.
+            if E.shape[0] > 3:
+                E = E[:3, :3]
+
+            if E.shape != (3, 3) or not np.all(np.isfinite(E)):
+                return None, None, 0, [], None
+
+            ransac_mask = mask.astype(np.uint8).reshape(-1, 1)
+            recovered, R, t, pose_mask = cv2.recoverPose(
+                E, pts1, pts2, K, mask=ransac_mask
+            )
+
+            if R is None or t is None or pose_mask is None:
+                return None, None, 0, [], None
+            if not np.all(np.isfinite(R)) or not np.all(np.isfinite(t)):
+                return None, None, 0, [], None
+            if not np.allclose(R.T @ R, np.eye(3), atol=1e-3):
+                return None, None, 0, [], None
+            if not np.isclose(np.linalg.det(R), 1.0, atol=1e-3):
+                return None, None, 0, [], None
+
+            # recoverPose mutates this mask to retain cheirality-valid matches.
+            pose_inlier_mask = pose_mask.ravel().astype(bool)
+            pose_matches = [
+                match for match, keep in zip(matches, pose_inlier_mask) if keep
+            ]
+            inliers = len(pose_matches)
+
+            if inliers < max(8, self.min_inliers):
+                return None, None, 0, [], None
+
+            return R, t.reshape(3, 1), inliers, pose_matches, E
+
+        except (cv2.error, ValueError, np.linalg.LinAlgError) as exc:
+            logger.warning("Relative pose recovery failed: %s", exc)
+            return None, None, 0, [], None
 
     def align(
         self,
@@ -232,26 +278,56 @@ class ImageAligner:
         # ── 4. Matching ─────────────────────────────────────────────
         pairs: List[MatchPair] = []
         for k, (i, j) in enumerate(candidate_pairs):
-            matches = self.match_features(features[i].descriptors, features[j].descriptors)
+            matches = self.match_features(
+                features[i].descriptors, features[j].descriptors
+            )
             if len(matches) >= self.min_inliers:
-                F, E, inliers, inlier_matches = self.geometric_verification(
+                F, _, geometric_inliers, inlier_matches = self.geometric_verification(
                     features[i].keypoints, features[j].keypoints, matches, K
                 )
-                if inliers >= self.min_inliers:
-                    R, t, _ = self.estimate_relative_pose(
-                        features[i].keypoints, features[j].keypoints, inlier_matches, K
+                if geometric_inliers >= self.min_inliers:
+                    (
+                        R,
+                        t,
+                        pose_inliers,
+                        pose_matches,
+                        pose_E,
+                    ) = self.estimate_relative_pose(
+                        features[i].keypoints,
+                        features[j].keypoints,
+                        inlier_matches,
+                        K,
                     )
-                    pairs.append(
-                        MatchPair(
-                            idx1=i, idx2=j, matches=inlier_matches, inliers=inliers,
-                            fundamental=F, essential=E, R=R, t=t,
+
+                    # Keep only valid poses and the exact matches used to recover them.
+                    if (
+                        R is not None
+                        and t is not None
+                        and pose_inliers >= self.min_inliers
+                        and len(pose_matches) == pose_inliers
+                    ):
+                        pairs.append(
+                            MatchPair(
+                                idx1=i,
+                                idx2=j,
+                                matches=pose_matches,
+                                inliers=pose_inliers,
+                                fundamental=F,
+                                essential=pose_E,
+                                R=R,
+                                t=t,
+                            )
                         )
-                    )
-                    logger.info(f"  Pair ({i},{j}): {inliers} inliers")
+                        logger.info(
+                            "  Pair (%d,%d): %d pose inliers",
+                            i, j, pose_inliers,
+                        )
 
             if progress_callback and k % 5 == 0:
-                progress_callback(0.15 + 0.75 * (k + 1) / total_pairs,
-                                  f"Matching pairs {k+1}/{total_pairs}")
+                progress_callback(
+                    0.15 + 0.75 * (k + 1) / max(total_pairs, 1),
+                    f"Matching pairs {k+1}/{total_pairs}",
+                )
 
         # ── 5. Components ───────────────────────────────────────────
         from collections import defaultdict
