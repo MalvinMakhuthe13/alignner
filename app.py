@@ -7,6 +7,8 @@ import cv2
 from pathlib import Path
 import tempfile
 import json
+import io
+import zipfile
 import plotly.graph_objects as go
 from src.aligner import ImageAligner, visualize_matches
 from src.image_selector import IntelligentImageSelector
@@ -139,6 +141,32 @@ if st.session_state.get("alignment_done") and "alignment_result" in st.session_s
     c2.metric("Verified Pairs", len(result.pairs))
     c3.metric("Components", len(result.components))
     c4.metric("Largest Component", max((len(c) for c in result.components), default=0))
+
+    if result.camera_poses:
+        st.subheader("Export")
+        st.caption("Download the registered sparse reconstruction as a COLMAP text model. Camera intrinsics are currently approximate.")
+        if st.button("Prepare COLMAP sparse model", type="secondary"):
+            with st.spinner("Building COLMAP model..."):
+                export_dir = Path(tempfile.mkdtemp(prefix="alignner_colmap_")) / "sparse" / "0"
+                sample = result.features[0]
+                focal = float(focal_override) if focal_override > 0 else max(sample.width, sample.height) * 1.15
+                K_export = np.array([[focal, 0, sample.width / 2.0],
+                                     [0, focal, sample.height / 2.0],
+                                     [0, 0, 1]], dtype=np.float64)
+                aligner_export = ImageAligner(feature_detector=detector, max_features=max_features,
+                                              match_ratio=match_ratio, min_inliers=min_inliers)
+                aligner_export.export_colmap(result, str(export_dir), K_export)
+                archive_buffer = io.BytesIO()
+                with zipfile.ZipFile(archive_buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+                    for file_path in export_dir.rglob("*"):
+                        if file_path.is_file():
+                            archive.write(file_path, file_path.relative_to(export_dir.parent))
+                st.session_state["colmap_export_zip"] = archive_buffer.getvalue()
+        if st.session_state.get("colmap_export_zip"):
+            st.download_button("Download COLMAP sparse model (.zip)",
+                               data=st.session_state["colmap_export_zip"],
+                               file_name="alignner_colmap_sparse_model.zip",
+                               mime="application/zip")
 
     st.subheader("Connected Components")
     for i, comp in enumerate(result.components):
