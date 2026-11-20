@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from pathlib import Path
 
@@ -44,6 +44,12 @@ class OpenMVSCommands:
             str(scene_path),
             "--resolution-level", str(config.resolution_level),
             "--number-views", str(config.densify_num_views),
+            "--number-views-fuse", str(config.densify_num_views_fuse),
+            "--geometric-iters", str(config.densify_geometric_iters),
+            "--fusion-depth-diff-threshold",
+            str(config.fusion_depth_diff_threshold),
+            "--fusion-reprojection-threshold",
+            str(config.fusion_reprojection_threshold),
             "--estimate-colors", "2" if config.estimate_colors else "0",
             "--max-threads", str(config.num_threads),
         ]
@@ -92,4 +98,3 @@ class OpenMVSCommands:
             "--output-file", str(output_path),
             "--max-threads", str(config.num_threads),
         ]
-
