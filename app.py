@@ -14,6 +14,7 @@ import plotly.graph_objects as go
 from src.aligner import ImageAligner, visualize_matches
 from src.image_selector import IntelligentImageSelector
 from src.image_contribution import score_image_contributions
+from src.viewer import render_ply_viewer
 
 st.set_page_config(page_title="Alignner", page_icon="📷", layout="wide")
 st.title("📷 Alignner")
@@ -22,6 +23,9 @@ st.markdown("""
 Upload photos or videos. Optionally run a conservative image-selection preflight
 before alignment. Original uploads are never modified.
 """)
+
+with st.expander("🧊 Open 3D Viewer", expanded=False):
+    render_ply_viewer()
 
 st.sidebar.header("Settings")
 detector = st.sidebar.selectbox("Feature Detector", ["orb", "sift"], index=0)
