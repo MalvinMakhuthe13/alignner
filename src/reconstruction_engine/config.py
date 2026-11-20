@@ -1,6 +1,7 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from dataclasses import dataclass
+from math import isfinite
 from typing import Literal
 
 
@@ -35,9 +36,13 @@ class ReconstructionConfig:
     min_num_matches: int = 15
     multiple_models: bool = False
 
-    # Dense reconstruction
+    # Dense reconstruction: depth estimation and geometric consistency.
     resolution_level: int = 2
     densify_num_views: int = 5
+    densify_num_views_fuse: int = 2
+    densify_geometric_iters: int = 2
+    fusion_depth_diff_threshold: float = 0.01
+    fusion_reprojection_threshold: float = 1.2
     estimate_colors: bool = True
 
     # Mesh reconstruction
@@ -75,6 +80,27 @@ class ReconstructionConfig:
 
         if self.spatial_max_distance <= 0:
             raise ValueError("spatial_max_distance must be positive")
+
+        if self.densify_num_views < 2:
+            raise ValueError("densify_num_views must be at least 2")
+
+        if self.densify_num_views_fuse < 2:
+            raise ValueError("densify_num_views_fuse must be at least 2")
+
+        if self.densify_geometric_iters < 0:
+            raise ValueError("densify_geometric_iters cannot be negative")
+
+        if (
+            not isfinite(self.fusion_depth_diff_threshold)
+            or self.fusion_depth_diff_threshold <= 0
+        ):
+            raise ValueError("fusion_depth_diff_threshold must be finite and positive")
+
+        if (
+            not isfinite(self.fusion_reprojection_threshold)
+            or self.fusion_reprojection_threshold <= 0
+        ):
+            raise ValueError("fusion_reprojection_threshold must be finite and positive")
 
     @classmethod
     def from_profile(
