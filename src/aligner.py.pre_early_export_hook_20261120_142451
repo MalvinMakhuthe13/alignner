@@ -1,0 +1,1551 @@
+"""
+Alignner - Image Alignment for Photogrammetry
+Inspired by RealityScan / RealityCapture alignment pipeline.
+
+Core features:
+- Feature detection & matching
+- Geometric verification (RANSAC)
+- Relative pose estimation
+- Simple multi-view alignment / component detection
+- Sparse point visualization (basic)
+"""
+
+import cv2
+import numpy as np
+from typing import List, Dict, Tuple, Optional
+from dataclasses import dataclass, field
+from pathlib import Path
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ImageFeatures:
+    path: str
+    keypoints: List[cv2.KeyPoint]
+    descriptors: np.ndarray
+    image: Optional[np.ndarray] = None
+    width: int = 0
+    height: int = 0
+
+
+@dataclass
+class MatchPair:
+    idx1: int
+    idx2: int
+    matches: List[cv2.DMatch]
+    inliers: int
+    fundamental: Optional[np.ndarray] = None
+    essential: Optional[np.ndarray] = None
+    R: Optional[np.ndarray] = None
+    t: Optional[np.ndarray] = None
+
+    # Correspondence evidence
+    raw_match_count: int = 0
+    fundamental_inliers: int = 0
+
+    @property
+    def geometric_inlier_ratio(self) -> float:
+        if self.raw_match_count <= 0:
+            return 0.0
+        return self.fundamental_inliers / self.raw_match_count
+
+    @property
+    def pose_retention_ratio(self) -> float:
+        if self.fundamental_inliers <= 0:
+            return 0.0
+        return self.inliers / self.fundamental_inliers
+
+    @property
+    def overall_inlier_ratio(self) -> float:
+        if self.raw_match_count <= 0:
+            return 0.0
+        return self.inliers / self.raw_match_count
+
+
+@dataclass
+class AlignmentResult:
+    features: List[ImageFeatures]
+    pairs: List[MatchPair]
+    components: List[List[int]]
+    camera_poses: Dict[int, Tuple[np.ndarray, np.ndarray]] = field(default_factory=dict)
+    sparse_points: Optional[np.ndarray] = None          # Nx3
+    point_colors: Optional[np.ndarray] = None           # Nx3
+    point_tracks: Optional[List] = None                 # list of (point_id, image_id, kp_idx)
+    camera_matrix: Optional[np.ndarray] = None           # exact intrinsics used during alignment
+
+
+class ImageAligner:
+    def __init__(
+        self,
+        feature_detector: str = "orb",
+        max_features: int = 5000,
+        match_ratio: float = 0.75,
+        min_inliers: int = 20,
+        ransac_thresh: float = 1.0,
+        match_window: int = 15,          # sequential: match each image to next N
+        use_sequential: bool = True,     # False = exhaustive (slow for large N)
+    ):
+        self.max_features = max_features
+        self.match_ratio = match_ratio
+        self.min_inliers = min_inliers
+        self.ransac_thresh = ransac_thresh
+        self.match_window = match_window
+        self.use_sequential = use_sequential
+
+        if feature_detector.lower() == "sift":
+            self.detector = cv2.SIFT_create(nfeatures=max_features)
+            self.matcher = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
+        else:
+            self.detector = cv2.ORB_create(nfeatures=max_features)
+            self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+
+    def load_image(self, path: str) -> Optional[np.ndarray]:
+        img = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        if img is None:
+            logger.warning(f"Failed to load image: {path}")
+            return None
+        return img
+
+    def extract_features(self, image: np.ndarray, path: str) -> ImageFeatures:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        keypoints, descriptors = self.detector.detectAndCompute(gray, None)
+        if descriptors is None:
+            descriptors = np.array([])
+        h, w = image.shape[:2]
+        return ImageFeatures(
+            path=path,
+            keypoints=keypoints or [],
+            descriptors=descriptors,
+            image=image,
+            width=w,
+            height=h,
+        )
+
+    def match_features(self, desc1: np.ndarray, desc2: np.ndarray) -> List[cv2.DMatch]:
+        if desc1 is None or desc2 is None or len(desc1) == 0 or len(desc2) == 0:
+            return []
+        try:
+            matches = self.matcher.knnMatch(desc1, desc2, k=2)
+            good = []
+            for m_n in matches:
+                if len(m_n) == 2:
+                    m, n = m_n
+                    if m.distance < self.match_ratio * n.distance:
+                        good.append(m)
+            return good
+        except Exception as e:
+            logger.debug(f"Matching failed: {e}")
+            return []
+
+    def geometric_verification(
+        self,
+        kp1: List[cv2.KeyPoint],
+        kp2: List[cv2.KeyPoint],
+        matches: List[cv2.DMatch],
+        K: Optional[np.ndarray] = None,
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], int, List[cv2.DMatch]]:
+        """Estimate fundamental/essential matrix and filter inliers."""
+        if len(matches) < 8:
+            return None, None, 0, []
+
+        pts1 = np.float32([kp1[m.queryIdx].pt for m in matches])
+        pts2 = np.float32([kp2[m.trainIdx].pt for m in matches])
+
+        # Fundamental matrix
+        F, mask = cv2.findFundamentalMat(
+            pts1, pts2, cv2.FM_RANSAC, self.ransac_thresh, 0.99
+        )
+        if F is None or mask is None:
+            return None, None, 0, []
+
+        inlier_mask = mask.ravel().astype(bool)
+        inliers = int(np.sum(inlier_mask))
+        inlier_matches = [m for m, keep in zip(matches, inlier_mask) if keep]
+
+        E = None
+        if K is not None and inliers >= 8:
+            # Essential matrix from fundamental if we have intrinsics
+            E = K.T @ F @ K
+
+        return F, E, inliers, inlier_matches
+
+
+    def estimate_relative_pose(
+        self,
+        kp1: List[cv2.KeyPoint],
+        kp2: List[cv2.KeyPoint],
+        matches: List[cv2.DMatch],
+        K: np.ndarray,
+    ) -> Tuple[
+        Optional[np.ndarray],
+        Optional[np.ndarray],
+        int,
+        List[cv2.DMatch],
+        Optional[np.ndarray],
+    ]:
+        """Recover a validated relative pose and exact cheirality-verified matches."""
+        if len(matches) < 8:
+            return None, None, 0, [], None
+
+        pts1 = np.float64([kp1[m.queryIdx].pt for m in matches])
+        pts2 = np.float64([kp2[m.trainIdx].pt for m in matches])
+
+        try:
+            E, mask = cv2.findEssentialMat(
+                pts1, pts2, K,
+                method=cv2.RANSAC,
+                prob=0.999,
+                threshold=self.ransac_thresh,
+            )
+
+            if E is None or mask is None:
+                return None, None, 0, [], None
+
+            if E.shape[0] > 3:
+                E = E[:3, :3]
+
+            if E.shape != (3, 3) or not np.all(np.isfinite(E)):
+                return None, None, 0, [], None
+
+            ransac_mask = mask.astype(np.uint8).reshape(-1, 1)
+
+            recovered, R, t, pose_mask = cv2.recoverPose(
+                E, pts1, pts2, K, mask=ransac_mask
+            )
+
+            if R is None or t is None or pose_mask is None:
+                return None, None, 0, [], None
+
+            if not np.all(np.isfinite(R)) or not np.all(np.isfinite(t)):
+                return None, None, 0, [], None
+
+            if not np.allclose(R.T @ R, np.eye(3), atol=1e-3):
+                return None, None, 0, [], None
+
+            if not np.isclose(np.linalg.det(R), 1.0, atol=1e-3):
+                return None, None, 0, [], None
+
+            pose_mask = pose_mask.reshape(-1).astype(bool)
+
+            if len(pose_mask) != len(matches):
+                return None, None, 0, [], None
+
+            pose_matches = [
+                match for match, keep in zip(matches, pose_mask) if keep
+            ]
+
+            inliers = int(recovered)
+
+            if inliers != len(pose_matches):
+                return None, None, 0, [], None
+
+            if inliers < max(8, self.min_inliers):
+                return None, None, 0, [], None
+
+            return R, t.reshape(3, 1), inliers, pose_matches, E
+
+        except (cv2.error, ValueError, np.linalg.LinAlgError) as exc:
+            logger.warning("Relative pose recovery failed: %s", exc)
+            return None, None, 0, [], None
+
+
+    def align(
+        self,
+        image_paths: List[str],
+        focal_length: Optional[float] = None,
+        principal_point: Optional[Tuple[float, float]] = None,
+        progress_callback=None,
+        max_neighbors: int = 12,
+        stage_callback=None,
+    ) -> AlignmentResult:
+        """
+        Main alignment pipeline.
+        For large sets (>40 images) only matches nearby + a few long-range pairs
+        so it stays practical while still connecting the sequence.
+        """
+        logger.info(f"Aligning {len(image_paths)} images...")
+
+        # â”€â”€ 1. Load & extract features â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        features: List[ImageFeatures] = []
+        n_total = len(image_paths)
+        for i, p in enumerate(image_paths):
+            img = self.load_image(p)
+            if img is not None:
+                feat = self.extract_features(img, p)
+                features.append(feat)
+                logger.info(f"  {Path(p).name}: {len(feat.keypoints)} features")
+            if progress_callback:
+                progress_callback(0.15 * (i + 1) / max(n_total, 1), f"Extracting features {i+1}/{n_total}")
+
+        n = len(features)
+        if n < 2:
+            return AlignmentResult(features=features, pairs=[], components=[])
+
+        # â”€â”€ 2. Intrinsics (improved) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        K = self.estimate_intrinsics(features, focal_length)
+
+        # â”€â”€ 3. Decide which pairs to match â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        if n <= 40:
+            # Full pairwise for small sets
+            candidate_pairs = [(i, j) for i in range(n) for j in range(i + 1, n)]
+        else:
+            # Smart mode: denser nearby + more long-range links for whole-object coverage
+            candidate_pairs = []
+            window = max(max_neighbors, 18)  # denser for better coverage
+            for i in range(n):
+                for d in range(1, window + 1):
+                    j = i + d
+                    if j < n:
+                        candidate_pairs.append((i, j))
+                # Extra longer jumps every few images
+                if i % 5 == 0:
+                    for d in range(window + 1, min(window * 4, n - i)):
+                        if d % 4 == 0:
+                            candidate_pairs.append((i, i + d))
+
+        total_pairs = len(candidate_pairs)
+        logger.info(f"Matching {total_pairs} candidate pairs (smart mode: {n > 40})")
+
+
+        # â”€â”€ 4. Matching â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        pairs: List[MatchPair] = []
+
+        for k, (i, j) in enumerate(candidate_pairs):
+            matches = self.match_features(
+                features[i].descriptors,
+                features[j].descriptors,
+            )
+
+            if len(matches) >= self.min_inliers:
+                F, E, inliers, inlier_matches = self.geometric_verification(
+                    features[i].keypoints,
+                    features[j].keypoints,
+                    matches,
+                    K,
+                )
+
+                if inliers >= self.min_inliers:
+                    R, t, pose_inliers, pose_matches, pose_E = (
+                        self.estimate_relative_pose(
+                            features[i].keypoints,
+                            features[j].keypoints,
+                            inlier_matches,
+                            K,
+                        )
+                    )
+
+                    if R is not None and t is not None:
+                        pairs.append(
+                            MatchPair(
+                                idx1=i,
+                                idx2=j,
+                                matches=pose_matches,
+                                inliers=pose_inliers,
+                                fundamental=F,
+                                essential=pose_E,
+                                R=R,
+                                t=t,
+                                raw_match_count=len(matches),
+                                fundamental_inliers=inliers,
+                            )
+                        )
+
+                        logger.info(
+                            "Pair (%d,%d): raw=%d | F-inliers=%d (%.1f%%) "
+                            "| pose-inliers=%d (%.1f%% overall)",
+                            i,
+                            j,
+                            len(matches),
+                            inliers,
+                            100.0 * inliers / max(len(matches), 1),
+                            pose_inliers,
+                            100.0 * pose_inliers / max(len(matches), 1),
+                        )
+
+            if progress_callback and k % 5 == 0:
+                progress_callback(
+                    0.15 + 0.75 * (k + 1) / max(total_pairs, 1),
+                    f"Matching pairs {k+1}/{total_pairs}",
+                )
+
+
+        # â”€â”€ 5. Components â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        from collections import defaultdict
+        graph = defaultdict(list)
+        for p in pairs:
+            graph[p.idx1].append(p.idx2)
+            graph[p.idx2].append(p.idx1)
+
+        visited = set()
+        components = []
+        for i in range(n):
+            if i not in visited:
+                comp = []
+                stack = [i]
+                while stack:
+                    node = stack.pop()
+                    if node not in visited:
+                        visited.add(node)
+                        comp.append(node)
+                        stack.extend(graph[node])
+                if comp:
+                    components.append(sorted(comp))
+
+        # â”€â”€ 6. Propagate poses â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        def emit_stage(stage, status, message, **details):
+            if stage_callback is not None:
+                event = {
+                    "stage": stage,
+                    "status": status,
+                    "message": message,
+                    **details,
+                }
+                stage_callback(event)
+
+        emit_stage(
+            "camera_estimation", "running",
+            "Estimating camera poses from verified matches",
+            components=len(components),
+            verified_pairs=len(pairs),
+        )
+        poses = self.propagate_poses(pairs, n)
+        emit_stage(
+            "camera_estimation", "completed",
+            "Initial camera poses estimated",
+            registered_cameras=len(poses),
+            total_cameras=n,
+            components=len(components),
+        )
+
+        # First distribute relative camera constraints globally. Triangulation
+        # must use the optimized camera geometry, not the initial chained poses.
+        if len(poses) >= 2:
+            emit_stage(
+                "pose_optimisation", "running",
+                "Optimising camera poses across the image graph",
+                registered_cameras=len(poses),
+            )
+            poses = self.optimize_pose_graph(pairs, poses, components)
+            emit_stage(
+                "pose_optimisation", "completed",
+                "Camera pose optimisation completed",
+                registered_cameras=len(poses),
+            )
+
+        # Multi-view triangulation + filtering using globally refined poses.
+        emit_stage(
+            "triangulation", "running",
+            "Building the initial 3D point cloud",
+            registered_cameras=len(poses),
+            verified_pairs=len(pairs),
+        )
+        sparse_pts, colors, tracks = self.triangulate_multiview(
+            features, pairs, poses, K
+        )
+        emit_stage(
+            "triangulation", "completed",
+            "Initial triangulation completed",
+            points=int(len(sparse_pts)) if sparse_pts is not None else 0,
+            tracks=len(tracks) if tracks is not None else 0,
+        )
+
+        # Refine camera poses and 3D points jointly against image observations.
+        if sparse_pts is not None and tracks and len(poses) >= 2:
+            emit_stage(
+                "bundle_adjustment", "running",
+                "Refining camera poses and 3D points",
+                points=int(len(sparse_pts)),
+                registered_cameras=len(poses),
+            )
+            poses, sparse_pts = self.bundle_adjust(
+                features, poses, sparse_pts, tracks, K, components=components
+            )
+            emit_stage(
+                "bundle_adjustment", "completed",
+                "Bundle adjustment completed",
+                points=int(len(sparse_pts)) if sparse_pts is not None else 0,
+                registered_cameras=len(poses),
+            )
+
+        if progress_callback:
+            progress_callback(1.0, "Done")
+
+        logger.info(f"Triangulated {len(sparse_pts) if sparse_pts is not None else 0} sparse points")
+        logger.info(f"Poses recovered for {len(poses)} / {n} cameras")
+        logger.info(f"Alignment complete: {len(pairs)} verified pairs, {len(components)} components")
+
+        return AlignmentResult(
+            features=features,
+            pairs=pairs,
+            components=components,
+            camera_poses=poses,
+            sparse_points=sparse_pts,
+            point_colors=colors,
+            point_tracks=tracks,
+            camera_matrix=K.copy(),
+        )
+
+    def estimate_intrinsics(self, features: List[ImageFeatures], focal_override: Optional[float]) -> np.ndarray:
+        """Better shared K. Uses override or a stronger heuristic based on image size."""
+        sample = features[0]
+        if focal_override is not None and focal_override > 0:
+            f = float(focal_override)
+        else:
+            # Common photogrammetry heuristic: ~1.0â€“1.4 Ã— longer side
+            f = max(sample.width, sample.height) * 1.15
+        cx, cy = sample.width / 2.0, sample.height / 2.0
+        return np.array([[f, 0, cx], [0, f, cy], [0, 0, 1]], dtype=np.float64)
+
+    def triangulate_multiview(
+        self,
+        features: List[ImageFeatures],
+        pairs: List[MatchPair],
+        poses: Dict[int, Tuple[np.ndarray, np.ndarray]],
+        K: np.ndarray,
+        max_points: int = 40000,
+        reproj_thresh: float = 2.5,
+        min_support_ratio: float = 0.70,
+        min_triangulation_angle_deg: float = 0.5,
+        progress_callback=None,
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[List]]:
+        """Build conflict-free tracks and robustly triangulate multi-view points.
+
+        Candidate camera pairs are evaluated using point-specific ray angles.
+        Reprojection consensus identifies unreliable observations individually.
+        Accepted points are refined using all supporting views.
+
+        Track observations retain the format:
+            (point_id, image_index, keypoint_index)
+        """
+        if max_points <= 0 or reproj_thresh <= 0:
+            raise ValueError("max_points and reproj_thresh must be positive.")
+
+        if not 0.5 <= min_support_ratio <= 1.0:
+            raise ValueError("min_support_ratio must be between 0.5 and 1.0.")
+
+        try:
+            min_triangulation_angle_deg = float(
+                min_triangulation_angle_deg
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "min_triangulation_angle_deg must be a finite "
+                "number in [0, 180)."
+            ) from exc
+
+        if (
+            not np.isfinite(min_triangulation_angle_deg)
+            or not 0.0 <= min_triangulation_angle_deg < 180.0
+        ):
+            raise ValueError(
+                "min_triangulation_angle_deg must be in [0, 180)."
+            )
+
+        K = np.asarray(K, dtype=np.float64)
+        if K.shape != (3, 3) or not np.all(np.isfinite(K)):
+            raise ValueError("K must be a finite 3x3 camera matrix.")
+
+        try:
+            K_inv = np.linalg.inv(K)
+        except np.linalg.LinAlgError as exc:
+            raise ValueError("Camera matrix K is singular.") from exc
+
+        # ---------------------------------------------------------
+        # 1. Build conflict-free feature tracks using union-find.
+        # ---------------------------------------------------------
+        parent = {}
+        observations = {}
+
+        def find(node):
+            parent.setdefault(node, node)
+            if parent[node] != node:
+                parent[node] = find(parent[node])
+            return parent[node]
+
+        def union(left, right):
+            rl, rr = find(left), find(right)
+            if rl == rr:
+                return True
+
+            ol = observations.get(rl, {left[0]: left[1]})
+            or_ = observations.get(rr, {right[0]: right[1]})
+
+            if any(
+                image_id in or_ and or_[image_id] != kp_id
+                for image_id, kp_id in ol.items()
+            ):
+                return False
+
+            parent[rr] = rl
+            observations[rl] = {**or_, **ol}
+            return True
+
+        for pair in pairs:
+            if pair.idx1 not in poses or pair.idx2 not in poses:
+                continue
+
+            if not (
+                0 <= pair.idx1 < len(features)
+                and 0 <= pair.idx2 < len(features)
+            ):
+                continue
+
+            for match in pair.matches:
+                if (
+                    match.queryIdx >= len(features[pair.idx1].keypoints)
+                    or match.trainIdx >= len(features[pair.idx2].keypoints)
+                ):
+                    continue
+
+                left = (pair.idx1, match.queryIdx)
+                right = (pair.idx2, match.trainIdx)
+
+                rl, rr = find(left), find(right)
+                if rl == rr:
+                    continue
+
+                observations.setdefault(rl, {left[0]: left[1]})
+                observations.setdefault(rr, {right[0]: right[1]})
+                union(left, right)
+
+        tracks_by_root = {}
+        for node in list(parent):
+            root = find(node)
+            tracks_by_root.setdefault(root, {})[node[0]] = node[1]
+
+        # ---------------------------------------------------------
+        # 2. Prepare camera geometry and triangulation helpers.
+        # ---------------------------------------------------------
+        camera_cache = {}
+
+        def camera_data(image_id, keypoint_id):
+            key = (image_id, keypoint_id)
+            if key in camera_cache:
+                return camera_cache[key]
+
+            R, t = poses[image_id]
+            R = np.asarray(R, dtype=np.float64).reshape(3, 3)
+            t = np.asarray(t, dtype=np.float64).reshape(3, 1)
+
+            if not np.all(np.isfinite(R)) or not np.all(np.isfinite(t)):
+                return None
+
+            uv = np.asarray(
+                features[image_id].keypoints[keypoint_id].pt,
+                dtype=np.float64,
+            )
+
+            if not np.all(np.isfinite(uv)):
+                return None
+
+            centre = -R.T @ t.reshape(3)
+            ray_camera = K_inv @ np.array([uv[0], uv[1], 1.0])
+            ray_world = R.T @ ray_camera
+
+            norm = np.linalg.norm(ray_world)
+            if norm < 1e-12:
+                return None
+
+            ray_world /= norm
+
+            P = K @ np.hstack((R, t))
+            result = (uv, centre, ray_world, R, t, P)
+            camera_cache[key] = result
+            return result
+
+        def triangulate_dlt(selected):
+            """Linear multi-view triangulation using all selected observations."""
+            rows = []
+
+            for image_id, keypoint_id in selected:
+                data = camera_data(image_id, keypoint_id)
+                if data is None:
+                    return None
+
+                uv, _, _, _, _, P = data
+                rows.append(uv[0] * P[2] - P[0])
+                rows.append(uv[1] * P[2] - P[1])
+
+            if len(rows) < 4:
+                return None
+
+            try:
+                _, _, vt = np.linalg.svd(
+                    np.asarray(rows, dtype=np.float64),
+                    full_matrices=False,
+                )
+            except np.linalg.LinAlgError:
+                return None
+
+            h = vt[-1]
+
+            if abs(h[3]) < 1e-10 or not np.all(np.isfinite(h)):
+                return None
+
+            point = h[:3] / h[3]
+
+            if not np.all(np.isfinite(point)):
+                return None
+
+            return point
+
+        def evaluate_observations(point, selected):
+            """Return observations passing cheirality and reprojection checks."""
+            accepted = []
+            errors = {}
+
+            for image_id, keypoint_id in selected:
+                data = camera_data(image_id, keypoint_id)
+                if data is None:
+                    continue
+
+                observed, _, _, R, t, _ = data
+                camera_point = R @ point.reshape(3, 1) + t
+
+                depth = float(camera_point[2, 0])
+                if not np.isfinite(depth) or depth <= 1e-8:
+                    continue
+
+                projected = K @ camera_point
+                if abs(projected[2, 0]) < 1e-12:
+                    continue
+
+                projected_uv = (
+                    projected[:2] / projected[2, 0]
+                ).reshape(2)
+
+                error = float(np.linalg.norm(projected_uv - observed))
+
+                if np.isfinite(error):
+                    errors[(image_id, keypoint_id)] = error
+
+                    if error <= reproj_thresh:
+                        accepted.append((image_id, keypoint_id))
+
+            return accepted, errors
+
+        # ---------------------------------------------------------
+        # 3. Find consensus and refine each feature track.
+        # ---------------------------------------------------------
+        points, colors, tracks = [], [], []
+        rejected_tracks = 0
+        rejected_observations = 0
+        total_tracks = len(tracks_by_root)
+        progress_interval = max(1, total_tracks // 100)
+        processed_tracks = 0
+        stopped_at_point_limit = False
+
+        for track_index, obs in enumerate(tracks_by_root.values(), start=1):
+            processed_tracks = track_index - 1
+
+            if progress_callback is not None and (
+                track_index == 1
+                or track_index % progress_interval == 0
+            ):
+                progress_callback({
+                    "stage": "triangulation",
+                    "status": "running",
+                    "message": f"Processing feature track {track_index}/{total_tracks}",
+                    "processed_tracks": processed_tracks,
+                    "total_tracks": total_tracks,
+                    "accepted_points": len(points),
+                    "rejected_tracks": rejected_tracks,
+                    "progress": processed_tracks / max(total_tracks, 1),
+                })
+
+            valid = [
+                (img_id, kp_id)
+                for img_id, kp_id in sorted(obs.items())
+                if (
+                    img_id in poses
+                    and 0 <= img_id < len(features)
+                    and 0 <= kp_id < len(features[img_id].keypoints)
+                )
+            ]
+
+            if len(valid) < 2:
+                rejected_tracks += 1
+                continue
+
+            required_support = max(
+                2,
+                int(np.ceil(len(valid) * min_support_ratio)),
+            )
+
+            # Cache valid rays and reject invalid camera observations.
+            usable = [
+                item for item in valid
+                if camera_data(*item) is not None
+            ]
+
+            if len(usable) < required_support:
+                rejected_tracks += 1
+                continue
+
+            # Each candidate pair generates a 3D hypothesis.
+            # Rank hypotheses by consensus first, then reprojection
+            # quality, then triangulation angle.
+            best_candidate = None
+            best_key = None
+
+            for i in range(len(usable)):
+                for j in range(i + 1, len(usable)):
+                    first = usable[i]
+                    second = usable[j]
+
+                    data_a = camera_data(*first)
+                    data_b = camera_data(*second)
+
+                    _, centre_a, ray_a, _, _, _ = data_a
+                    _, centre_b, ray_b, _, _, _ = data_b
+
+                    cosine = float(np.clip(
+                        np.dot(ray_a, ray_b), -1.0, 1.0
+                    ))
+                    angle = float(np.degrees(np.arccos(cosine)))
+
+                    if angle < min_triangulation_angle_deg:
+                        continue
+
+                    candidate = triangulate_dlt([first, second])
+                    if candidate is None:
+                        continue
+
+                    inliers, errors = evaluate_observations(
+                        candidate, usable
+                    )
+
+                    if len(inliers) < required_support:
+                        continue
+
+                    median_error = float(np.median([
+                        errors[item] for item in inliers
+                    ]))
+
+                    candidate_key = (
+                        len(inliers),
+                        -median_error,
+                        angle,
+                    )
+
+                    if (
+                        best_key is None
+                        or candidate_key > best_key
+                    ):
+                        best_key = candidate_key
+                        best_candidate = (candidate, inliers)
+
+            if best_candidate is None:
+                rejected_tracks += 1
+                continue
+
+            # Refine until the point and its supporting observations agree.
+            point, inliers = best_candidate
+            converged = False
+            final_inliers = None
+            final_errors = {}
+
+            for _ in range(10):
+                refined = triangulate_dlt(inliers)
+
+                if refined is None:
+                    break
+
+                updated_inliers, updated_errors = evaluate_observations(
+                    refined, usable
+                )
+
+                if len(updated_inliers) < required_support:
+                    break
+
+                point = refined
+
+                if set(updated_inliers) == set(inliers):
+                    final_inliers = updated_inliers
+                    final_errors = updated_errors
+                    converged = True
+                    break
+
+                inliers = updated_inliers
+
+            if not converged:
+                rejected_tracks += 1
+                continue
+
+            # Independently verify that the final point supports exactly
+            # the observations that will be stored in its track.
+            checked_inliers, checked_errors = evaluate_observations(
+                point, usable
+            )
+
+            if (
+                len(checked_inliers) < required_support
+                or set(checked_inliers) != set(final_inliers)
+            ):
+                rejected_tracks += 1
+                continue
+
+            final_inliers = checked_inliers
+            final_errors = checked_errors
+
+            # Store only the observations supporting the final point.
+            if len(points) >= max_points:
+                stopped_at_point_limit = True
+                break
+
+            point_id = len(points)
+            points.append(point)
+
+            rejected_observations += len(valid) - len(final_inliers)
+
+            # Use a surviving observation to sample point colour.
+            colour = [140, 140, 140]
+
+            for image_id, keypoint_id in final_inliers:
+                image = features[image_id].image
+
+                if image is None:
+                    continue
+
+                x, y = map(
+                    int,
+                    features[image_id].keypoints[keypoint_id].pt,
+                )
+
+                if (
+                    0 <= y < image.shape[0]
+                    and 0 <= x < image.shape[1]
+                ):
+                    colour = image[y, x][::-1].tolist()
+                    break
+
+            colors.append(colour)
+
+            tracks.extend(
+                (point_id, image_id, keypoint_id)
+                for image_id, keypoint_id in final_inliers
+            )
+
+        if not stopped_at_point_limit:
+            processed_tracks = total_tracks
+
+        if progress_callback is not None:
+            progress_callback({
+                "stage": "triangulation",
+                "status": "completed",
+                "message": "Feature-track triangulation finished",
+                "processed_tracks": processed_tracks,
+                "total_tracks": total_tracks,
+                "accepted_points": len(points),
+                "rejected_tracks": rejected_tracks,
+                "rejected_observations": rejected_observations,
+                "progress": processed_tracks / max(total_tracks, 1),
+                "stopped_at_point_limit": stopped_at_point_limit,
+            })
+
+        logger.info(
+            "Robust triangulation: %d points accepted, "
+            "%d tracks rejected, %d observations filtered",
+            len(points),
+            rejected_tracks,
+            rejected_observations,
+        )
+
+        if not points:
+            return None, None, None
+
+        return (
+            np.asarray(points, dtype=np.float64),
+            np.asarray(colors, dtype=np.uint8),
+            tracks,
+        )
+
+    def optimize_pose_graph(
+        self,
+        pairs: List[MatchPair],
+        poses: Dict[int, Tuple[np.ndarray, np.ndarray]],
+        components: List[List[int]],
+        max_nfev: int = 80,
+    ) -> Dict[int, Tuple[np.ndarray, np.ndarray]]:
+        """Robustly distribute pairwise rotation/translation constraints globally.
+
+        Translation scale is unknown in monocular two-view geometry, so each
+        edge receives a positive scalar. Components are solved independently
+        with one fixed anchor pose each.
+        """
+        from scipy.optimize import least_squares
+        from scipy.spatial.transform import Rotation
+        from scipy.sparse import lil_matrix
+
+        refined = {
+            idx: (np.asarray(R, dtype=np.float64).reshape(3, 3).copy(),
+                  np.asarray(t, dtype=np.float64).reshape(3, 1).copy())
+            for idx, (R, t) in poses.items()
+        }
+        for component in components:
+            camera_ids = sorted(idx for idx in component if idx in refined)
+            if len(camera_ids) < 2:
+                continue
+            camera_set = set(camera_ids)
+            edges = [
+                pair for pair in pairs
+                if pair.idx1 in camera_set and pair.idx2 in camera_set
+                and pair.R is not None and pair.t is not None
+            ]
+            if len(edges) < len(camera_ids) - 1:
+                continue
+
+            anchor = camera_ids[0]
+            variable_ids = camera_ids[1:]
+            offsets = {idx: 6 * i for i, idx in enumerate(variable_ids)}
+            edge_offset = 6 * len(variable_ids)
+            initial_pose = {}
+            for idx in variable_ids:
+                R, t = refined[idx]
+                initial_pose[idx] = np.concatenate([
+                    Rotation.from_matrix(R).as_rotvec(), t.reshape(3)
+                ])
+            scales = []
+            for edge in edges:
+                Ri, ti = refined[edge.idx1]
+                Rj, tj = refined[edge.idx2]
+                Rrel = np.asarray(edge.R, dtype=np.float64).reshape(3, 3)
+                trel = np.asarray(edge.t, dtype=np.float64).reshape(3)
+                predicted_t = tj.reshape(3) - (Rj @ Ri.T) @ ti.reshape(3)
+                denom = float(trel @ trel)
+                scale = float(predicted_t @ trel / denom) if denom > 1e-10 else 1.0
+                scales.append(max(scale, 1e-3))
+            x0 = np.concatenate(
+                [np.concatenate([initial_pose[idx] for idx in variable_ids]),
+                 np.asarray(scales, dtype=np.float64)]
+            )
+
+            # Each edge depends on its endpoint camera poses and its scale.
+            jac_sparsity = lil_matrix(
+                (6 * len(edges), len(x0)),
+                dtype=np.int8,
+            )
+
+            for edge_index, edge in enumerate(edges):
+                row_start = 6 * edge_index
+                row_end = row_start + 6
+
+                for camera_id in (edge.idx1, edge.idx2):
+                    if camera_id != anchor:
+                        col_start = offsets[camera_id]
+                        jac_sparsity[
+                            row_start:row_end,
+                            col_start:col_start + 6
+                        ] = 1
+
+                scale_col = edge_offset + edge_index
+                jac_sparsity[row_start:row_end, scale_col] = 1
+
+            def unpack(params):
+                local = {anchor: refined[anchor]}
+                for idx in variable_ids:
+                    off = offsets[idx]
+                    R = Rotation.from_rotvec(params[off:off + 3]).as_matrix()
+                    t = params[off + 3:off + 6].reshape(3, 1)
+                    local[idx] = (R, t)
+                return local
+
+            def residuals(params):
+                local = unpack(params)
+                residual = []
+                for edge_index, edge in enumerate(edges):
+                    Ri, ti = local[edge.idx1]
+                    Rj, tj = local[edge.idx2]
+                    R_meas = np.asarray(edge.R, dtype=np.float64).reshape(3, 3)
+                    t_meas = np.asarray(edge.t, dtype=np.float64).reshape(3)
+                    R_pred = Rj @ Ri.T
+                    rotation_error = Rotation.from_matrix(R_meas.T @ R_pred).as_rotvec()
+                    translation_error = (
+                        tj.reshape(3) - R_pred @ ti.reshape(3)
+                        - params[edge_offset + edge_index] * t_meas
+                    )
+                    residual.extend(rotation_error.tolist())
+                    residual.extend(translation_error.tolist())
+                return np.asarray(residual, dtype=np.float64)
+
+            try:
+                lower = np.full_like(x0, -np.inf)
+                upper = np.full_like(x0, np.inf)
+                lower[edge_offset:] = 1e-4
+                optimized = least_squares(
+                    residuals,
+                    x0,
+                    bounds=(lower, upper),
+                    loss="soft_l1",
+                    f_scale=0.05,
+                    max_nfev=max_nfev,
+                    jac_sparsity=jac_sparsity,
+                    tr_solver="lsmr",
+                )
+                if np.all(np.isfinite(optimized.x)):
+                    local = unpack(optimized.x)
+                    refined.update(local)
+                    logger.info("Pose graph optimized %d cameras / %d edges (cost %.5f)",
+                                len(camera_ids), len(edges), optimized.cost)
+            except (ValueError, np.linalg.LinAlgError) as exc:
+                logger.warning("Pose graph optimization skipped for component %s: %s",
+                               camera_ids, exc)
+        return refined
+
+    def bundle_adjust(
+        self,
+        features: List[ImageFeatures],
+        poses: Dict[int, Tuple[np.ndarray, np.ndarray]],
+        points: np.ndarray,
+        tracks: List,
+        K: np.ndarray,
+        components: Optional[List[List[int]]] = None,
+        max_points_per_component: int = 500,
+        max_nfev: int = 25,
+    ) -> Tuple[Dict[int, Tuple[np.ndarray, np.ndarray]], np.ndarray]:
+        """Robust reprojection-error bundle adjustment, optimized per component.
+
+        One camera per component is fixed to remove the 6-DoF gauge freedom.
+        Components are optimized independently because their world frames are
+        unrelated. SciPy is already a project dependency.
+        """
+        from scipy.optimize import least_squares
+        from scipy.spatial.transform import Rotation
+        from scipy.sparse import lil_matrix
+
+        if points is None or len(points) == 0 or not tracks:
+            return poses, points
+
+        components = components or [sorted(poses)]
+        refined_poses = {idx: (np.asarray(R).copy(), np.asarray(t).reshape(3, 1).copy())
+                         for idx, (R, t) in poses.items()}
+        refined_points = np.asarray(points, dtype=np.float64).copy()
+
+        observations_by_point = {}
+        for point_id, image_idx, keypoint_idx in tracks:
+            if (0 <= point_id < len(refined_points) and image_idx in poses
+                    and 0 <= keypoint_idx < len(features[image_idx].keypoints)):
+                uv = np.asarray(features[image_idx].keypoints[keypoint_idx].pt, dtype=np.float64)
+                observations_by_point.setdefault(int(point_id), []).append((int(image_idx), uv))
+
+        for component in components:
+            camera_ids = sorted(idx for idx in component if idx in refined_poses)
+            if len(camera_ids) < 2:
+                continue
+            camera_set = set(camera_ids)
+            point_ids = [
+                pid for pid, obs in observations_by_point.items()
+                if len({img for img, _ in obs if img in camera_set}) >= 2
+            ][:max_points_per_component]
+            if len(point_ids) < 8:
+                continue
+
+            anchor = camera_ids[0]
+            variable_cameras = camera_ids[1:]
+            point_lookup = {pid: i for i, pid in enumerate(point_ids)}
+            obs_rows = []
+            for pid in point_ids:
+                for image_idx, uv in observations_by_point[pid]:
+                    if image_idx in camera_set:
+                        obs_rows.append((image_idx, point_lookup[pid], uv))
+            if len(obs_rows) < 16:
+                continue
+
+            initial_rot = {idx: Rotation.from_matrix(refined_poses[idx][0]).as_rotvec()
+                           for idx in variable_cameras}
+            initial_t = {idx: refined_poses[idx][1].reshape(3) for idx in variable_cameras}
+            initial_points = refined_points[point_ids].copy()
+            x0 = np.concatenate(
+                [np.concatenate([initial_rot[i], initial_t[i]]) for i in variable_cameras]
+                + [initial_points.reshape(-1)]
+            )
+            camera_offset = {idx: 6 * i for i, idx in enumerate(variable_cameras)}
+            points_offset = 6 * len(variable_cameras)
+
+            # Each 2D observation depends on its camera pose (if variable)
+            # and its corresponding 3D point.
+            jac_sparsity = lil_matrix(
+                (2 * len(obs_rows), len(x0)),
+                dtype=np.int8,
+            )
+
+            for observation_index, (image_idx, point_slot, _) in enumerate(obs_rows):
+                row_start = 2 * observation_index
+                row_end = row_start + 2
+
+                if image_idx != anchor:
+                    camera_col = camera_offset[image_idx]
+                    jac_sparsity[
+                        row_start:row_end,
+                        camera_col:camera_col + 6
+                    ] = 1
+
+                point_col = points_offset + 3 * point_slot
+                jac_sparsity[
+                    row_start:row_end,
+                    point_col:point_col + 3
+                ] = 1
+
+            def unpack(params):
+                local_poses = {anchor: refined_poses[anchor]}
+                for idx in variable_cameras:
+                    off = camera_offset[idx]
+                    R = Rotation.from_rotvec(params[off:off + 3]).as_matrix()
+                    t = params[off + 3:off + 6].reshape(3, 1)
+                    local_poses[idx] = (R, t)
+                local_points = params[points_offset:].reshape(-1, 3)
+                return local_poses, local_points
+
+            def residuals(params):
+                local_poses, local_points = unpack(params)
+                residual = np.empty((len(obs_rows), 2), dtype=np.float64)
+                for row, (image_idx, point_slot, observed) in enumerate(obs_rows):
+                    R, t = local_poses[image_idx]
+                    camera_point = R @ local_points[point_slot].reshape(3, 1) + t
+                    z = float(camera_point[2, 0])
+                    if z <= 1e-6:
+                        residual[row] = [1000.0 + abs(z), 1000.0 + abs(z)]
+                        continue
+                    projected = K @ camera_point
+                    uv = (projected[:2] / projected[2, 0]).reshape(2)
+                    residual[row] = uv - observed
+                return residual.reshape(-1)
+
+            try:
+                optimized = least_squares(
+                    residuals,
+                    x0,
+                    loss="soft_l1",
+                    f_scale=2.0,
+                    max_nfev=max_nfev,
+                    method="trf",
+                    jac_sparsity=jac_sparsity,
+                    tr_solver="lsmr",
+                )
+                if not np.all(np.isfinite(optimized.x)):
+                    continue
+                local_poses, local_points = unpack(optimized.x)
+                for idx, pose in local_poses.items():
+                    refined_poses[idx] = (pose[0], pose[1].reshape(3, 1))
+                refined_points[point_ids] = local_points
+                logger.info(
+                    "Bundle adjustment component %s: %.3f -> %.3f px robust cost",
+                    camera_ids, optimized.cost * 2 / max(len(obs_rows), 1),
+                    np.mean(np.abs(optimized.fun)),
+                )
+            except (ValueError, np.linalg.LinAlgError) as exc:
+                logger.warning("Bundle adjustment skipped for component %s: %s", camera_ids, exc)
+
+        return refined_poses, refined_points
+
+    def bundle_adjust_light(
+        self,
+        features: List[ImageFeatures],
+        poses: Dict[int, Tuple[np.ndarray, np.ndarray]],
+        points: np.ndarray,
+        tracks: List,
+        K: np.ndarray,
+        max_iter: int = 8,
+    ) -> Tuple[Dict, np.ndarray]:
+        """Very lightweight pose + point refinement (gradient-free / simple iterative)."""
+        # For prototype: only refine translation scale consistency on a subset
+        # Full Ceres-style BA is heavy; this reduces drift a bit.
+        refined_poses = {k: (R.copy(), t.copy()) for k, (R, t) in poses.items()}
+        refined_pts = points.copy()
+
+        # Simple scale normalization so median camera distance is ~1
+        centers = []
+        for idx, (R, t) in refined_poses.items():
+            C = -R.T @ t.flatten()
+            centers.append(np.linalg.norm(C))
+        if centers:
+            med = np.median([c for c in centers if c > 1e-3]) or 1.0
+            scale = 1.0 / med
+            for idx in refined_poses:
+                R, t = refined_poses[idx]
+                refined_poses[idx] = (R, t * scale)
+            refined_pts *= scale
+
+        return refined_poses, refined_pts
+
+    def propagate_poses(self, pairs: List[MatchPair], n: int) -> Dict[int, Tuple[np.ndarray, np.ndarray]]:
+        """Propagate poses independently through every connected camera component.
+
+        Each component receives its own identity reference camera. Coordinates
+        between disconnected components are therefore local and must not be
+        interpreted as sharing a common world frame.
+        """
+        from collections import defaultdict, deque
+
+        adj = defaultdict(list)
+        for pair in pairs:
+            if pair.R is None or pair.t is None:
+                continue
+            if not (0 <= pair.idx1 < n and 0 <= pair.idx2 < n):
+                continue
+            R_rel = np.asarray(pair.R, dtype=np.float64).reshape(3, 3)
+            t_rel = np.asarray(pair.t, dtype=np.float64).reshape(3, 1)
+            adj[pair.idx1].append((pair.idx2, R_rel, t_rel))
+            R_inv = R_rel.T
+            adj[pair.idx2].append((pair.idx1, R_inv, -R_inv @ t_rel))
+
+        poses: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
+        for root in range(n):
+            if root in poses or not adj[root]:
+                continue
+            poses[root] = (np.eye(3, dtype=np.float64), np.zeros((3, 1), dtype=np.float64))
+            queue = deque([root])
+            while queue:
+                curr = queue.popleft()
+                R_curr, t_curr = poses[curr]
+                for neigh, R_rel, t_rel in adj[curr]:
+                    if neigh in poses:
+                        continue
+                    poses[neigh] = (R_rel @ R_curr, R_rel @ t_curr + t_rel)
+                    queue.append(neigh)
+
+        return poses
+
+    def triangulate_sparse(
+        self,
+        features: List[ImageFeatures],
+        pairs: List[MatchPair],
+        poses: Dict[int, Tuple[np.ndarray, np.ndarray]],
+        K: np.ndarray,
+        max_points: int = 50000,
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[List]]:
+        """Simple pairwise triangulation of inlier matches that have known poses."""
+        points = []
+        colors = []
+        tracks = []
+        point_id = 0
+
+        for pair in pairs:
+            if pair.idx1 not in poses or pair.idx2 not in poses:
+                continue
+            if len(pair.matches) < 8:
+                continue
+
+            R1, t1 = poses[pair.idx1]
+            R2, t2 = poses[pair.idx2]
+
+            # Projection matrices
+            P1 = K @ np.hstack((R1, t1))
+            P2 = K @ np.hstack((R2, t2))
+
+            pts1 = np.float32([features[pair.idx1].keypoints[m.queryIdx].pt for m in pair.matches]).T
+            pts2 = np.float32([features[pair.idx2].keypoints[m.trainIdx].pt for m in pair.matches]).T
+
+            pts4d = cv2.triangulatePoints(P1, P2, pts1, pts2)
+            pts3d = (pts4d[:3] / pts4d[3]).T
+
+            # Filter reasonable points
+            for i, pt in enumerate(pts3d):
+                if np.any(np.isnan(pt)) or np.any(np.abs(pt) > 1000):
+                    continue
+                points.append(pt)
+                # Color from first image
+                x, y = int(pts1[0, i]), int(pts1[1, i])
+                img = features[pair.idx1].image
+                if img is not None and 0 <= y < img.shape[0] and 0 <= x < img.shape[1]:
+                    colors.append(img[y, x][::-1])  # BGR -> RGB
+                else:
+                    colors.append([128, 128, 128])
+
+                tracks.append((point_id, pair.idx1, pair.matches[i].queryIdx))
+                tracks.append((point_id, pair.idx2, pair.matches[i].trainIdx))
+                point_id += 1
+
+                if len(points) >= max_points:
+                    break
+            if len(points) >= max_points:
+                break
+
+        if not points:
+            return None, None, None
+        return np.array(points), np.array(colors), tracks
+
+    def export_colmap(
+        self,
+        result: AlignmentResult,
+        output_dir: str,
+        K: np.ndarray,
+        images_dir: Optional[str] = None,
+    ) -> str:
+        """Export a text sparse model with consistent image observations and point tracks.
+
+        Only registered images (those with estimated poses) are written. The
+        model is a valid COLMAP text-model layout, but its camera/intrinsic
+        estimates remain those produced by this prototype.
+        """
+        if not result.features:
+            raise ValueError("Cannot export an empty alignment result.")
+
+        out = Path(output_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        image_output_dir = (
+            Path(images_dir) if images_dir is not None else out / "images"
+        )
+        image_output_dir.mkdir(parents=True, exist_ok=True)
+
+        registered = sorted(idx for idx in result.camera_poses if 0 <= idx < len(result.features))
+        if not registered:
+            raise ValueError("No registered camera poses are available for COLMAP export.")
+
+        # COLMAP image IDs are positive integers and independent of source indices.
+        image_ids = {idx: position + 1 for position, idx in enumerate(registered)}
+        image_names = {}
+        used_names = set()
+        for idx in registered:
+            source_name = Path(result.features[idx].path).name
+            name = source_name
+            if name in used_names:
+                name = f"{idx:06d}_{source_name}"
+            used_names.add(name)
+            image_names[idx] = name
+            image = result.features[idx].image
+            if image is not None and not cv2.imwrite(
+                str(image_output_dir / name), image
+            ):
+                raise IOError(f"Could not write exported image: {name}")
+
+        # Each image's POINTS2D list is built once. The index in this list is
+        # exactly the POINT2D_IDX referenced by points3D.txt.
+        image_observations = {idx: [] for idx in registered}
+        point_observations = {}
+        if result.point_tracks:
+            for point_id, image_idx, keypoint_idx in result.point_tracks:
+                if image_idx not in image_ids or point_id < 0:
+                    continue
+                if point_id >= (0 if result.sparse_points is None else len(result.sparse_points)):
+                    continue
+                if keypoint_idx < 0 or keypoint_idx >= len(result.features[image_idx].keypoints):
+                    continue
+                uv = result.features[image_idx].keypoints[keypoint_idx].pt
+                point_observations.setdefault(int(point_id), []).append((image_idx, int(keypoint_idx), uv))
+
+        # Keep only points observed in at least two registered images.
+        valid_point_ids = {
+            point_id for point_id, observations in point_observations.items()
+            if len({obs[0] for obs in observations if obs[0] in image_ids}) >= 2
+        }
+
+        # Remove duplicate observations and assign stable per-image 2D indices.
+        point2d_indices = {}
+        for image_idx in registered:
+            seen_keypoints = set()
+            entries = []
+            for point_id in sorted(valid_point_ids):
+                for obs_image, keypoint_idx, uv in point_observations[point_id]:
+                    if obs_image != image_idx or keypoint_idx in seen_keypoints:
+                        continue
+                    seen_keypoints.add(keypoint_idx)
+                    point2d_idx = len(entries)
+                    entries.append((float(uv[0]), float(uv[1]), point_id))
+                    point2d_indices[(point_id, image_idx)] = point2d_idx
+            image_observations[image_idx] = entries
+
+        sample = result.features[registered[0]]
+        fx, fy, cx, cy = (float(K[0, 0]), float(K[1, 1]), float(K[0, 2]), float(K[1, 2]))
+        with open(out / "cameras.txt", "w", encoding="utf-8") as f:
+            f.write("# Camera list with one line of data per camera:\n")
+            f.write("# CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n")
+            f.write("1 PINHOLE {} {} {:.12g} {:.12g} {:.12g} {:.12g}\n".format(
+                sample.width, sample.height, fx, fy, cx, cy
+            ))
+
+        with open(out / "images.txt", "w", encoding="utf-8") as f:
+            f.write("# Image list with two lines of data per image:\n")
+            f.write("# IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME\n")
+            f.write("# POINTS2D[] as (X, Y, POINT3D_ID)\n")
+            for idx in registered:
+                R, t = result.camera_poses[idx]
+                q = self.rotmat_to_quat(np.asarray(R, dtype=np.float64))
+                tx, ty, tz = np.asarray(t).reshape(3)
+                f.write("{} {:.12g} {:.12g} {:.12g} {:.12g} {:.12g} {:.12g} {:.12g} 1 {}\n".format(
+                    image_ids[idx], *q, tx, ty, tz, image_names[idx]
+                ))
+                entries = image_observations[idx]
+                f.write(" ".join(
+                    "{:.6f} {:.6f} {}".format(x, y, point_id + 1)
+                    for x, y, point_id in entries
+                ) + "\n")
+
+        with open(out / "points3D.txt", "w", encoding="utf-8") as f:
+            f.write("# 3D point list with one line of data per point:\n")
+            f.write("# POINT3D_ID, X, Y, Z, R, G, B, ERROR, TRACK[]\n")
+            if result.sparse_points is not None:
+                colors = result.point_colors
+                for point_id, point in enumerate(result.sparse_points):
+                    obs = []
+                    seen_images = set()
+                    for image_idx, _, _ in point_observations.get(point_id, []):
+                        key = (point_id, image_idx)
+                        if (image_idx in image_ids and key in point2d_indices
+                                and image_idx not in seen_images):
+                            obs.append((image_ids[image_idx], point2d_indices[key]))
+                            seen_images.add(image_idx)
+                    # COLMAP points need at least two image observations.
+                    if len(obs) < 2:
+                        continue
+                    color = colors[point_id] if colors is not None and point_id < len(colors) else [128, 128, 128]
+                    r, g, b = [int(np.clip(v, 0, 255)) for v in color]
+                    track_text = " ".join(f"{image_id} {point2d_idx}" for image_id, point2d_idx in obs)
+                    f.write("{:d} {:.12g} {:.12g} {:.12g} {:d} {:d} {:d} 0 {}".format(
+                        point_id + 1, point[0], point[1], point[2], r, g, b, track_text
+                    ) + "\n")
+
+        return str(out)
+
+    @staticmethod
+    def rotmat_to_quat(R: np.ndarray) -> np.ndarray:
+        """Rotation matrix to quaternion (w, x, y, z)."""
+        m = R
+        t = np.trace(m)
+        if t > 0:
+            s = 0.5 / np.sqrt(t + 1.0)
+            w = 0.25 / s
+            x = (m[2,1] - m[1,2]) * s
+            y = (m[0,2] - m[2,0]) * s
+            z = (m[1,0] - m[0,1]) * s
+        else:
+            if m[0,0] > m[1,1] and m[0,0] > m[2,2]:
+                s = 2.0 * np.sqrt(1.0 + m[0,0] - m[1,1] - m[2,2])
+                w = (m[2,1] - m[1,2]) / s
+                x = 0.25 * s
+                y = (m[0,1] + m[1,0]) / s
+                z = (m[0,2] + m[2,0]) / s
+            elif m[1,1] > m[2,2]:
+                s = 2.0 * np.sqrt(1.0 + m[1,1] - m[0,0] - m[2,2])
+                w = (m[0,2] - m[2,0]) / s
+                x = (m[0,1] + m[1,0]) / s
+                y = 0.25 * s
+                z = (m[1,2] + m[2,1]) / s
+            else:
+                s = 2.0 * np.sqrt(1.0 + m[2,2] - m[0,0] - m[1,1])
+                w = (m[1,0] - m[0,1]) / s
+                x = (m[0,2] + m[2,0]) / s
+                y = (m[1,2] + m[2,1]) / s
+                z = 0.25 * s
+        return np.array([w, x, y, z])
+
+
+def visualize_matches(
+    img1: np.ndarray,
+    kp1: List[cv2.KeyPoint],
+    img2: np.ndarray,
+    kp2: List[cv2.KeyPoint],
+    matches: List[cv2.DMatch],
+    max_draw: int = 50,
+) -> np.ndarray:
+    """Draw match lines between two images side by side."""
+    vis = cv2.drawMatches(
+        img1, kp1, img2, kp2, matches[:max_draw], None,
+        flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS
+    )
+    return vis
+
+

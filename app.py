@@ -5,6 +5,7 @@ import streamlit as st
 import numpy as np
 import cv2
 from pathlib import Path
+from datetime import datetime
 import tempfile
 import json
 import io
@@ -12,6 +13,7 @@ import zipfile
 import plotly.graph_objects as go
 from src.aligner import ImageAligner, visualize_matches
 from src.image_selector import IntelligentImageSelector
+from src.image_contribution import score_image_contributions
 
 st.set_page_config(page_title="Alignner", page_icon="📷", layout="wide")
 st.title("📷 Alignner")
@@ -103,15 +105,144 @@ if st.button("🚀 Align", type="primary"):
             with st.spinner(f"Aligning {len(all_paths)} images/frames..."):
                 progress_bar = st.progress(0)
                 status_text = st.empty()
+                stage_status = st.empty()
+                stage_metrics = st.empty()
+                triangulation_bar = st.progress(0)
+                export_notice = st.empty()
+
+                # Keep each run separate so Brush can continue reading
+                # an earlier export without files being overwritten.
+                run_root = (
+                    Path.cwd()
+                    / "Alignner_Output"
+                    / f"run_{datetime.now():%Y%m%d_%H%M%S}"
+                )
+                images_dir = run_root / "images"
+                images_dir.mkdir(parents=True, exist_ok=True)
+
                 def update_progress(frac, msg):
                     progress_bar.progress(min(1.0, float(frac)))
                     status_text.caption(msg)
-                aligner = ImageAligner(feature_detector=detector, max_features=max_features,
-                                       match_ratio=match_ratio, min_inliers=min_inliers)
+
+                def update_stage(event):
+                    stage = event.get("stage", "pipeline")
+                    state = event.get("status", "running")
+                    message = event.get("message", "")
+                    stage_status.caption(
+                        f"**{stage.replace('_', ' ').title()}** ? {state}: {message}"
+                    )
+
+                    if stage == "triangulation":
+                        fraction = float(event.get("progress", 0.0))
+                        triangulation_bar.progress(
+                            min(1.0, max(0.0, fraction))
+                        )
+                        stage_metrics.caption(
+                            "Tracks: "
+                            f"{event.get('processed_tracks', 0):,} / "
+                            f"{event.get('total_tracks', 0):,}  ?  "
+                            f"Accepted points: "
+                            f"{event.get('accepted_points', 0):,}  ?  "
+                            f"Rejected tracks: "
+                            f"{event.get('rejected_tracks', 0):,}"
+                        )
+
+                    if stage == "initial_export" and state == "completed":
+                        export_notice.success(
+                            "Initial COLMAP model is ready for Brush: "
+                            f"{event.get('export_path', '')}"
+                        )
+
+                aligner = ImageAligner(
+                    feature_detector=detector,
+                    max_features=max_features,
+                    match_ratio=match_ratio,
+                    min_inliers=min_inliers,
+                )
+
+                def export_initial_model(snapshot):
+                    if snapshot.camera_matrix is None:
+                        raise RuntimeError(
+                            "Initial export failed: camera matrix is missing."
+                        )
+
+                    sparse_dir = (
+                        run_root
+                        / "exports"
+                        / "01_initial"
+                        / "sparse"
+                        / "0"
+                    )
+
+                    exported_path = aligner.export_colmap(
+                        snapshot,
+                        str(sparse_dir),
+                        snapshot.camera_matrix,
+                        images_dir=str(images_dir),
+                    )
+
+                    required_files = (
+                        sparse_dir / "cameras.txt",
+                        sparse_dir / "images.txt",
+                        sparse_dir / "points3D.txt",
+                    )
+                    missing = [
+                        str(file) for file in required_files
+                        if not file.is_file() or file.stat().st_size == 0
+                    ]
+                    if missing:
+                        raise RuntimeError(
+                            "Initial COLMAP export is incomplete: "
+                            + ", ".join(missing)
+                        )
+
+                    st.session_state["initial_colmap_path"] = exported_path
+                    st.session_state["alignner_output_dir"] = str(run_root)
+                    return exported_path
+
                 focal = float(focal_override) if focal_override > 0 else None
-                result = aligner.align(all_paths, focal_length=focal, progress_callback=update_progress)
+
+                result = aligner.align(
+                    all_paths,
+                    focal_length=focal,
+                    progress_callback=update_progress,
+                    stage_callback=update_stage,
+                    early_export_callback=export_initial_model,
+                )
+
+                # Save the refined result separately after bundle adjustment.
+                refined_path = None
+                if (
+                    result.camera_matrix is not None
+                    and result.sparse_points is not None
+                    and result.point_tracks
+                    and result.camera_poses
+                ):
+                    refined_dir = (
+                        run_root
+                        / "exports"
+                        / "02_refined"
+                        / "sparse"
+                        / "0"
+                    )
+                    refined_path = aligner.export_colmap(
+                        result,
+                        str(refined_dir),
+                        result.camera_matrix,
+                        images_dir=str(images_dir),
+                    )
+                    st.session_state["refined_colmap_path"] = refined_path
+
+                st.session_state["alignner_output_dir"] = str(run_root)
                 progress_bar.progress(1.0)
-                status_text.caption("Finished")
+                status_text.caption("Alignment and export finished")
+
+                if refined_path:
+                    st.success(
+                        f"Refined COLMAP model exported: {refined_path}"
+                    )
+
+            st.session_state.pop("contribution_report", None)
             st.session_state["alignment_result"] = result
             st.session_state["alignment_done"] = True
 
@@ -141,6 +272,112 @@ if st.session_state.get("alignment_done") and "alignment_result" in st.session_s
     c2.metric("Verified Pairs", len(result.pairs))
     c3.metric("Components", len(result.components))
     c4.metric("Largest Component", max((len(c) for c in result.components), default=0))
+
+    # Post-alignment contribution analysis. This is diagnostic only:
+    # it does not remove images or change the reconstruction.
+    st.subheader("Image Contribution Report")
+    st.caption(
+        "Ranks images using verified geometric support, multi-view tracks, "
+        "per-image feature coverage, reprojection quality and parallax. "
+        "Low scores are review flags, not deletion instructions."
+    )
+
+    if "contribution_report" not in st.session_state:
+        with st.spinner("Evaluating image contributions..."):
+            st.session_state["contribution_report"] = score_image_contributions(result)
+
+    contribution_report = st.session_state["contribution_report"]
+
+    if contribution_report.warnings:
+        for warning in contribution_report.warnings:
+            st.warning(warning)
+
+    ranked_images = sorted(
+        contribution_report.images,
+        key=lambda item: item.contribution_score,
+        reverse=True,
+    )
+
+    high_count = sum(x.assessment == "high contribution" for x in ranked_images)
+    review_count = sum(
+        x.assessment in ("needs review", "possible redundancy ? review before excluding")
+        for x in ranked_images
+    )
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Images evaluated", len(ranked_images))
+    m2.metric("High contribution", high_count)
+    m3.metric("Needs review", review_count)
+
+    contribution_rows = []
+    for rank, item in enumerate(ranked_images, start=1):
+        feature = result.features[item.image_index]
+        reprojection = (
+            round(item.mean_reprojection_error_px, 3)
+            if item.mean_reprojection_error_px is not None else None
+        )
+        parallax = (
+            round(item.mean_parallax_deg, 2)
+            if item.mean_parallax_deg is not None else None
+        )
+
+        contribution_rows.append({
+            "Rank": rank,
+            "Image": Path(feature.path).name,
+            "Score": round(item.contribution_score, 1),
+            "Assessment": item.assessment,
+            "Verified pairs": item.pair_count,
+            "Pose inliers": item.pose_inliers,
+            "3D point tracks": item.point_track_count,
+            "Image coverage": round(item.grid_coverage * 100, 1),
+            "Mean reprojection (px)": reprojection,
+            "Mean parallax (?)": parallax,
+            "Geometric inlier ratio": round(item.geometric_inlier_ratio, 3),
+            "Pose retention ratio": round(item.pose_retention_ratio, 3),
+            "Explanation": "; ".join(item.notes),
+        })
+
+    if contribution_rows:
+        st.dataframe(
+            contribution_rows,
+            use_container_width=True,
+            hide_index=True,
+        )
+    else:
+        st.info("No image contribution metrics were available.")
+
+    st.info(
+        "Important: contribution scores are relative rankings within connected "
+        "components. They are not probabilities, and images must not be removed "
+        "solely because of a low score."
+    )
+
+
+    if result.camera_poses:
+        pose_export = {
+            "num_images": len(result.features),
+            "components": [
+                [int(idx) for idx in component]
+                for component in result.components
+            ],
+            "poses": {
+                str(int(idx)): {
+                    "R": R.tolist(),
+                    "t": t.flatten().tolist(),
+                    "name": Path(result.features[idx].path).name,
+                }
+                for idx, (R, t) in result.camera_poses.items()
+                if 0 <= idx < len(result.features)
+            },
+        }
+
+        st.download_button(
+            "Download poses (JSON)",
+            data=json.dumps(pose_export, indent=2),
+            file_name="alignner_poses.json",
+            mime="application/json",
+            key="download_poses_json",
+        )
 
     if result.camera_poses:
         st.subheader("Export")
@@ -250,7 +487,7 @@ if st.session_state.get("alignment_done") and "alignment_result" in st.session_s
                 st.write(f"**Pose recovered:** {'Yes' if names.index(selected) in result.camera_poses else 'No'}")
 
     if st.button("Clear results"):
-        for key in ("alignment_result", "alignment_done", "selection_result", "selection_csv", "match_idx"):
+        for key in ("alignment_result", "alignment_done", "selection_result", "selection_csv", "match_idx", "contribution_report"):
             st.session_state.pop(key, None)
         st.rerun()
 
