@@ -32,6 +32,11 @@ detector = st.sidebar.selectbox("Feature Detector", ["orb", "sift"], index=0)
 max_features = st.sidebar.slider("Max Features / Image", 1000, 12000, 5000, step=500)
 match_ratio = st.sidebar.slider("Lowe's Ratio", 0.5, 0.9, 0.75, 0.05)
 min_inliers = st.sidebar.slider("Min Inliers", 8, 80, 15)
+min_support_ratio = st.sidebar.slider(
+    "Min track support ratio (experimental)",
+    0.40, 0.70, 0.70, 0.05,
+    help="Default 0.70 preserves production behaviour. Lower values are experimental and only affect the next Align run."
+)
 focal_override = st.sidebar.number_input("Focal Length (px, 0=auto)", 0.0, step=50.0)
 
 st.sidebar.markdown("---")
@@ -113,6 +118,9 @@ if st.button("🚀 Align", type="primary"):
                 stage_metrics = st.empty()
                 triangulation_bar = st.progress(0)
                 export_notice = st.empty()
+                live_preview_title = st.empty()
+                live_preview_metrics = st.empty()
+                live_preview_chart = st.empty()
 
                 # Keep each run separate so Brush can continue reading
                 # an earlier export without files being overwritten.
@@ -128,13 +136,171 @@ if st.button("🚀 Align", type="primary"):
                     progress_bar.progress(min(1.0, float(frac)))
                     status_text.caption(msg)
 
+                def render_live_preview(event):
+                    poses = event.get("camera_poses")
+                    points = event.get("sparse_points")
+                    point_colors = event.get("point_colors")
+                    tracks = event.get("point_tracks") or []
+                    components = event.get("components") or []
+
+                    if poses is None:
+                        poses = live_preview_state.get("camera_poses", {})
+                    else:
+                        live_preview_state["camera_poses"] = poses
+                    if components:
+                        live_preview_state["components"] = components
+                    else:
+                        components = live_preview_state.get("components", [])
+                    if points is None:
+                        points = live_preview_state.get("sparse_points")
+                    else:
+                        live_preview_state["sparse_points"] = points
+                        live_preview_state["point_colors"] = point_colors
+                        live_preview_state["point_tracks"] = tracks
+                    if points is None:
+                        points = np.empty((0, 3), dtype=np.float64)
+                    points = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+
+                    live_poses = live_preview_state.get("camera_poses", {})
+                    live_preview_title.subheader("Live reconstruction preview")
+                    live_preview_metrics.caption(
+                        f"{len(live_poses)} registered cameras • "
+                        f"{len(points):,} triangulated points"
+                    )
+                    if not live_poses and not len(points):
+                        return
+
+                    fig = go.Figure()
+                    palette_live = [
+                        "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728",
+                        "#9467bd", "#8c564b", "#e377c2", "#7f7f7f",
+                        "#bcbd22", "#17becf",
+                    ]
+                    component_of_live = {
+                        image_idx: ci
+                        for ci, component in enumerate(components)
+                        for image_idx in component
+                    }
+                    for idx, (R, t) in sorted(live_poses.items()):
+                        R = np.asarray(R, dtype=np.float64).reshape(3, 3)
+                        t = np.asarray(t, dtype=np.float64).reshape(3)
+                        centre = -R.T @ t
+                        ci = component_of_live.get(idx, 0)
+                        color = palette_live[ci % len(palette_live)]
+                        fig.add_trace(go.Scatter3d(
+                            x=[centre[0]], y=[centre[1]], z=[centre[2]],
+                            mode="markers",
+                            marker=dict(size=5, color=color),
+                            name=f"Camera {idx + 1}",
+                            showlegend=False,
+                            hovertemplate=f"Camera {idx + 1}<extra></extra>",
+                        ))
+                        forward = R.T[:, 2]
+                        right = R.T[:, 0]
+                        up = -R.T[:, 1]
+                        scale = 0.15
+                        base = centre + forward * scale
+                        hw, hh = scale * 0.6, scale * 0.45
+                        corners = [
+                            base + right * hw + up * hh,
+                            base - right * hw + up * hh,
+                            base - right * hw - up * hh,
+                            base + right * hw - up * hh,
+                        ]
+                        for corner in corners:
+                            fig.add_trace(go.Scatter3d(
+                                x=[centre[0], corner[0]],
+                                y=[centre[1], corner[1]],
+                                z=[centre[2], corner[2]],
+                                mode="lines",
+                                line=dict(color=color, width=2),
+                                showlegend=False,
+                                hoverinfo="skip",
+                            ))
+                        closed = corners + [corners[0]]
+                        fig.add_trace(go.Scatter3d(
+                            x=[p[0] for p in closed],
+                            y=[p[1] for p in closed],
+                            z=[p[2] for p in closed],
+                            mode="lines",
+                            line=dict(color=color, width=2),
+                            showlegend=False,
+                            hoverinfo="skip",
+                        ))
+
+                    if len(points):
+                        display_points = points
+                        display_colors = live_preview_state.get("point_colors")
+                        sample_indices = np.arange(len(display_points))
+                        if len(display_points) > 12000:
+                            # Deterministic preview sampling avoids visual flicker.
+                            sample_indices = np.linspace(
+                                0, len(display_points) - 1, 12000, dtype=int
+                            )
+                            display_points = display_points[sample_indices]
+                        if display_colors is not None:
+                            display_colors = np.asarray(display_colors)
+                            if (
+                                display_colors.ndim == 2
+                                and len(display_colors) == len(points)
+                                and display_colors.shape[1] >= 3
+                            ):
+                                sampled_rgb = display_colors[sample_indices, :3]
+                                marker_colors = [
+                                    f"rgb({int(rgb[0])},{int(rgb[1])},{int(rgb[2])})"
+                                    for rgb in sampled_rgb
+                                ]
+                            else:
+                                marker_colors = "#d9e6f2"
+                        else:
+                            marker_colors = "#d9e6f2"
+                        fig.add_trace(go.Scatter3d(
+                            x=display_points[:, 0],
+                            y=display_points[:, 1],
+                            z=display_points[:, 2],
+                            mode="markers",
+                            marker=dict(size=1.8, color=marker_colors, opacity=0.75),
+                            name="Live sparse points",
+                        ))
+                    fig.update_layout(
+                        scene=dict(
+                            aspectmode="data",
+                            xaxis_title="X",
+                            yaxis_title="Y",
+                            zaxis_title="Z",
+                        ),
+                        height=560,
+                        margin=dict(l=0, r=0, b=0, t=20),
+                        showlegend=False,
+                    )
+                    live_preview_chart.plotly_chart(
+                        fig, use_container_width=True
+                    )
+
+                triangulation_diagnostics = {}
+
+                live_preview_state = {
+                    "camera_poses": {},
+                    "components": [],
+                    "sparse_points": None,
+                    "point_colors": None,
+                    "point_tracks": [],
+                }
+
                 def update_stage(event):
                     stage = event.get("stage", "pipeline")
                     state = event.get("status", "running")
                     message = event.get("message", "")
+                    if stage == "triangulation_diagnostics":
+                        triangulation_diagnostics.update(
+                            event.get("diagnostics", {})
+                        )
                     stage_status.caption(
-                        f"**{stage.replace('_', ' ').title()}** ? {state}: {message}"
+                        f"**{stage.replace('_', ' ').title()}** — {state}: {message}"
                     )
+
+                    if stage == "live_preview":
+                        render_live_preview(event)
 
                     if stage == "triangulation":
                         fraction = float(event.get("progress", 0.0))
@@ -212,7 +378,45 @@ if st.button("🚀 Align", type="primary"):
                     progress_callback=update_progress,
                     stage_callback=update_stage,
                     early_export_callback=export_initial_model,
+                    min_support_ratio=float(min_support_ratio),
                 )
+
+                # Save and display triangulation diagnostics.
+                if triangulation_diagnostics:
+                    diagnostics_dir = run_root / "diagnostics"
+                    diagnostics_dir.mkdir(parents=True, exist_ok=True)
+                    diagnostics_path = (
+                        diagnostics_dir / "triangulation_diagnostics.json"
+                    )
+                    with diagnostics_path.open("w", encoding="utf-8") as f:
+                        json.dump(
+                            triangulation_diagnostics,
+                            f,
+                            indent=2,
+                            default=lambda value: (
+                                value.item() if hasattr(value, "item")
+                                else str(value)
+                            ),
+                        )
+
+                    st.session_state["triangulation_diagnostics"] = (
+                        triangulation_diagnostics
+                    )
+                    st.subheader("Triangulation Diagnostics")
+                    d = triangulation_diagnostics
+                    m1, m2, m3, m4 = st.columns(4)
+                    m1.metric("Feature tracks", f"{d.get('total_tracks', 0):,}")
+                    m2.metric("Accepted points", f"{d.get('accepted_points', 0):,}")
+                    m3.metric("Rejected tracks", f"{d.get('rejected_tracks', 0):,}")
+                    m4.metric("Rejected observations", f"{d.get('rejected_observations', 0):,}")
+                    with st.expander("Full triangulation diagnostic report", expanded=True):
+                        st.json(triangulation_diagnostics)
+                    st.caption(f"Diagnostic JSON saved to: {diagnostics_path}")
+                else:
+                    st.warning(
+                        "No triangulation diagnostics event was received. "
+                        "The reconstruction result is otherwise unchanged."
+                    )
 
                 # Save the refined result separately after bundle adjustment.
                 refined_path = None
@@ -445,36 +649,225 @@ if st.session_state.get("alignment_done") and "alignment_result" in st.session_s
                      use_container_width=True)
             st.caption(f"Pair {st.session_state.match_idx+1} of {len(sorted_pairs)} • Green lines = verified matches")
 
-    if result.camera_poses or result.sparse_points is not None:
-        st.subheader("Cameras + Sparse Points")
+    # ── Component-aware diagnostic visualisation (geometry unchanged) ──
+    if len(result.components) > 1:
+        st.warning(
+            f"{len(result.components)} independent components detected. "
+            "Each component has its own local coordinate frame. "
+            "They are shown together only for inspection and are **not** in a common world frame."
+        )
+
+    # Build component index map
+    component_of = {}
+    for ci, comp in enumerate(result.components):
+        for idx in comp:
+            component_of[idx] = ci
+
+    # Distinct colours
+    palette = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+               "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"]
+
+    # Component show/hide
+    st.subheader("Components")
+    show_component = []
+    cols = st.columns(min(4, max(1, len(result.components))))
+    for ci, comp in enumerate(result.components):
+        with cols[ci % len(cols)]:
+            show_component.append(
+                st.checkbox(
+                    f"Component {ci+1} ({len(comp)} images)",
+                    value=True,
+                    key=f"show_comp_{ci}"
+                )
+            )
+
+    # Point colouring mode
+    colour_mode = st.selectbox(
+        "Sparse point colouring",
+        ["Component membership", "Observation count (track length)", "Reprojection error"],
+        index=0,
+        key="point_colour_mode"
+    )
+
+    # Camera selector for inspection
+    camera_options = []
+    for idx in sorted(result.camera_poses):
+        name = Path(result.features[idx].path).name
+        ci = component_of.get(idx, -1)
+        camera_options.append((idx, f"{name} (comp {ci+1})"))
+    selected_cam_label = st.selectbox(
+        "Inspect camera",
+        [label for _, label in camera_options] if camera_options else ["(none)"],
+        key="inspect_camera"
+    )
+    selected_cam_idx = None
+    if camera_options:
+        for idx, label in camera_options:
+            if label == selected_cam_label:
+                selected_cam_idx = idx
+                break
+
+    if selected_cam_idx is not None:
+        feat = result.features[selected_cam_idx]
+        ci = component_of.get(selected_cam_idx, -1)
+        pair_count = sum(1 for p in result.pairs if selected_cam_idx in (p.idx1, p.idx2))
+        st.write(f"**Component:** {ci+1} • **Verified pairs:** {pair_count} • "
+                 f"**Pose recovered:** Yes")
+        if feat.image is not None:
+            st.image(cv2.cvtColor(feat.image, cv2.COLOR_BGR2RGB),
+                     caption=Path(feat.path).name, use_container_width=True)
+
+    # Build Plotly figure
+    if result.camera_poses or (result.sparse_points is not None and len(result.sparse_points)):
+        st.subheader("Cameras + Sparse Points (component-aware)")
         fig = go.Figure()
-        if result.camera_poses:
-            positions = []
-            for idx in sorted(result.camera_poses):
+
+        # Helper: camera centre (OpenCV convention X_cam = R X_world + t)
+        def camera_center(R, t):
+            return -R.T @ np.asarray(t).reshape(3)
+
+        # Frustum wireframe scale (scene-relative later; fixed for now)
+        frustum_scale = 0.15
+
+        for ci, comp in enumerate(result.components):
+            if not show_component[ci]:
+                continue
+            color = palette[ci % len(palette)]
+            centers = []
+            labels = []
+            for idx in sorted(comp):
+                if idx not in result.camera_poses:
+                    continue
                 R, t = result.camera_poses[idx]
-                positions.append(-R.T @ t.flatten())
-            if positions:
-                pos = np.array(positions)
-                fig.add_trace(go.Scatter3d(x=pos[:,0], y=pos[:,1], z=pos[:,2],
-                    mode="markers+lines", marker=dict(size=4), line=dict(width=4), name="Camera path"))
+                C = camera_center(R, t)
+                centers.append(C)
+                labels.append(Path(result.features[idx].path).name)
+
+                # Viewing direction (camera +Z in world)
+                forward = R.T[:, 2]
+                # Simple pyramid frustum
+                right = R.T[:, 0]
+                up = -R.T[:, 1]  # OpenCV Y-down → flip for visual
+                apex = C
+                base_center = C + forward * frustum_scale
+                hw, hh = frustum_scale * 0.6, frustum_scale * 0.45
+                corners = [
+                    base_center + right * hw + up * hh,
+                    base_center - right * hw + up * hh,
+                    base_center - right * hw - up * hh,
+                    base_center + right * hw - up * hh,
+                ]
+                # Draw pyramid edges
+                for cnr in corners:
+                    fig.add_trace(go.Scatter3d(
+                        x=[apex[0], cnr[0]], y=[apex[1], cnr[1]], z=[apex[2], cnr[2]],
+                        mode="lines", line=dict(color=color, width=2),
+                        showlegend=False, hoverinfo="skip"
+                    ))
+                # Base
+                base_closed = corners + [corners[0]]
+                fig.add_trace(go.Scatter3d(
+                    x=[p[0] for p in base_closed],
+                    y=[p[1] for p in base_closed],
+                    z=[p[2] for p in base_closed],
+                    mode="lines", line=dict(color=color, width=2),
+                    showlegend=False, hoverinfo="skip"
+                ))
+
+            if centers:
+                arr = np.array(centers)
+                fig.add_trace(go.Scatter3d(
+                    x=arr[:,0], y=arr[:,1], z=arr[:,2],
+                    mode="markers+text",
+                    marker=dict(size=6, color=color),
+                    text=labels,
+                    textposition="top center",
+                    name=f"Component {ci+1} ({len(comp)})"
+                ))
+
+        # Sparse points coloured by selected mode
         if result.sparse_points is not None and len(result.sparse_points):
             pts = result.sparse_points
+            # Map each point to a component via its tracks
+            point_component = {}
+            obs_count = {}
+            if result.point_tracks:
+                for pid, img_idx, _ in result.point_tracks:
+                    point_component[pid] = component_of.get(img_idx, -1)
+                    obs_count[pid] = obs_count.get(pid, 0) + 1
+
+            colors = []
+            for i in range(len(pts)):
+                ci = point_component.get(i, -1)
+                if colour_mode == "Component membership":
+                    colors.append(palette[ci % len(palette)] if ci >= 0 else "#aaaaaa")
+                elif colour_mode == "Observation count (track length)":
+                    n = obs_count.get(i, 0)
+                    # Simple heat: more observations = darker blue
+                    intensity = min(1.0, n / 8.0)
+                    colors.append(f"rgba(0, {int(80+intensity*175)}, 255, 0.8)")
+                else:
+                    # Reprojection error not stored; mark as unavailable
+                    colors.append("#cccccc")
+
+            # Subsample if huge
             if len(pts) > 20000:
                 ix = np.random.choice(len(pts), 20000, replace=False)
                 pts = pts[ix]
-                cols = result.point_colors[ix] if result.point_colors is not None else None
-            else:
-                cols = result.point_colors
-            fig.add_trace(go.Scatter3d(x=pts[:,0], y=pts[:,1], z=pts[:,2], mode="markers",
-                marker=dict(size=1.8, color=cols if cols is not None else "orange", opacity=0.65),
-                name="Sparse points"))
-        fig.add_trace(go.Scatter3d(x=[0], y=[0], z=[0], mode="markers",
-            marker=dict(size=8, symbol="diamond"), name="Origin"))
-        fig.update_layout(scene=dict(aspectmode="data", xaxis_title="X", yaxis_title="Y", zaxis_title="Z"),
-                          height=700, margin=dict(l=0, r=0, b=0, t=30))
+                colors = [colors[i] for i in ix]
+
+            fig.add_trace(go.Scatter3d(
+                x=pts[:,0], y=pts[:,1], z=pts[:,2],
+                mode="markers",
+                marker=dict(size=1.6, color=colors, opacity=0.7),
+                name="Sparse points"
+            ))
+
+        fig.update_layout(
+            scene=dict(aspectmode="data", xaxis_title="X", yaxis_title="Y", zaxis_title="Z"),
+            height=720, margin=dict(l=0, r=0, b=0, t=30),
+            legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01)
+        )
         st.plotly_chart(fig, use_container_width=True)
-        st.caption(f"{len(result.camera_poses)} cameras posed • "
-                   f"{0 if result.sparse_points is None else len(result.sparse_points)} sparse points.")
+        if colour_mode == "Reprojection error":
+            st.caption("Reprojection error colouring is unavailable: per-point reprojection errors are not stored in the current result.")
+        st.caption(
+            f"{len(result.camera_poses)} cameras • "
+            f"{0 if result.sparse_points is None else len(result.sparse_points)} sparse points. "
+            "Components use independent local frames."
+        )
+
+    # Per-component COLMAP export
+    if result.camera_poses and result.components:
+        st.subheader("Per-component COLMAP export")
+        st.caption("Each component is exported in its own local frame. No transforms are invented.")
+        for ci, comp in enumerate(result.components):
+            if st.button(f"Export Component {ci+1} ({len(comp)} images)", key=f"export_comp_{ci}"):
+                with st.spinner(f"Exporting component {ci+1}..."):
+                    export_dir = Path(tempfile.mkdtemp(prefix=f"alignner_comp{ci+1}_")) / "sparse" / "0"
+                    sample = result.features[comp[0]]
+                    focal = float(focal_override) if focal_override > 0 else max(sample.width, sample.height) * 1.15
+                    K_export = np.array([[focal, 0, sample.width / 2.0],
+                                         [0, focal, sample.height / 2.0],
+                                         [0, 0, 1]], dtype=np.float64)
+                    aligner_export = ImageAligner()
+                    aligner_export.export_colmap_component(
+                        result, ci, str(export_dir), K_export
+                    )
+                    buf = io.BytesIO()
+                    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                        for p in export_dir.rglob("*"):
+                            if p.is_file():
+                                zf.write(p, p.relative_to(export_dir.parent))
+                    st.session_state[f"comp_export_{ci}"] = buf.getvalue()
+            if st.session_state.get(f"comp_export_{ci}"):
+                st.download_button(
+                    f"Download Component {ci+1} COLMAP model",
+                    data=st.session_state[f"comp_export_{ci}"],
+                    file_name=f"alignner_component_{ci+1}_colmap.zip",
+                    mime="application/zip",
+                    key=f"dl_comp_{ci}"
+                )
 
     st.subheader("Browse Images")
     if result.features:

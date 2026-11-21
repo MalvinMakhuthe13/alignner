@@ -19,7 +19,7 @@ import logging
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
+from .pose_diagnostics import pose_constraint_diagnostics
 
 @dataclass
 class ImageFeatures:
@@ -261,6 +261,7 @@ class ImageAligner:
         max_neighbors: int = 12,
         stage_callback=None,
         early_export_callback=None,
+        min_support_ratio: float = 0.70,
     ) -> AlignmentResult:
         """
         Main alignment pipeline.
@@ -269,7 +270,7 @@ class ImageAligner:
         """
         logger.info(f"Aligning {len(image_paths)} images...")
 
-        # â”€â”€ 1. Load & extract features â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ 1. Load & extract features ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬
         features: List[ImageFeatures] = []
         n_total = len(image_paths)
         for i, p in enumerate(image_paths):
@@ -285,10 +286,10 @@ class ImageAligner:
         if n < 2:
             return AlignmentResult(features=features, pairs=[], components=[])
 
-        # â”€â”€ 2. Intrinsics (improved) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ 2. Intrinsics (improved) ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬
         K = self.estimate_intrinsics(features, focal_length)
 
-        # â”€â”€ 3. Decide which pairs to match â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ 3. Decide which pairs to match ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬
         if n <= 40:
             # Full pairwise for small sets
             candidate_pairs = [(i, j) for i in range(n) for j in range(i + 1, n)]
@@ -311,7 +312,7 @@ class ImageAligner:
         logger.info(f"Matching {total_pairs} candidate pairs (smart mode: {n > 40})")
 
 
-        # â”€â”€ 4. Matching â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ 4. Matching ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬
         pairs: List[MatchPair] = []
 
         for k, (i, j) in enumerate(candidate_pairs):
@@ -373,7 +374,7 @@ class ImageAligner:
                 )
 
 
-        # â”€â”€ 5. Components â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ 5. Components ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬
         from collections import defaultdict
         graph = defaultdict(list)
         for p in pairs:
@@ -395,7 +396,7 @@ class ImageAligner:
                 if comp:
                     components.append(sorted(comp))
 
-        # â”€â”€ 6. Propagate poses â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ 6. Propagate poses ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬
         def emit_stage(stage, status, message, **details):
             if stage_callback is not None:
                 event = {
@@ -413,6 +414,20 @@ class ImageAligner:
             verified_pairs=len(pairs),
         )
         poses = self.propagate_poses(pairs, n)
+        pose_diagnostics_before = pose_constraint_diagnostics(
+            pairs, poses, components
+        )
+        logger.info(
+            "POSE CONSTRAINTS BEFORE OPTIMIZATION: %s",
+            pose_diagnostics_before,
+        )
+        emit_stage(
+            "pose_diagnostics",
+            "completed",
+            "Initial camera-pose constraint residuals measured",
+            phase="before_optimization",
+            diagnostics=pose_diagnostics_before,
+        )
         emit_stage(
             "camera_estimation", "completed",
             "Initial camera poses estimated",
@@ -420,6 +435,20 @@ class ImageAligner:
             total_cameras=n,
             components=len(components),
         )
+        if stage_callback is not None:
+            stage_callback({
+                "stage": "live_preview",
+                "status": "running",
+                "message": "Initial camera positions are available",
+                "camera_poses": {
+                    idx: (R.copy(), t.copy())
+                    for idx, (R, t) in poses.items()
+                },
+                "components": [list(component) for component in components],
+                "sparse_points": None,
+                "point_colors": None,
+                "point_tracks": [],
+            })
 
         # First distribute relative camera constraints globally. Triangulation
         # must use the optimized camera geometry, not the initial chained poses.
@@ -430,11 +459,39 @@ class ImageAligner:
                 registered_cameras=len(poses),
             )
             poses = self.optimize_pose_graph(pairs, poses, components)
+            pose_diagnostics_after = pose_constraint_diagnostics(
+                pairs, poses, components
+            )
+            logger.info(
+                "POSE CONSTRAINTS AFTER OPTIMIZATION: %s",
+                pose_diagnostics_after,
+            )
+            emit_stage(
+                "pose_diagnostics",
+                "completed",
+                "Optimized camera-pose constraint residuals measured",
+                phase="after_optimization",
+                diagnostics=pose_diagnostics_after,
+            )
             emit_stage(
                 "pose_optimisation", "completed",
                 "Camera pose optimisation completed",
                 registered_cameras=len(poses),
             )
+            if stage_callback is not None:
+                stage_callback({
+                    "stage": "live_preview",
+                    "status": "running",
+                    "message": "Globally optimised camera positions",
+                    "camera_poses": {
+                        idx: (R.copy(), t.copy())
+                        for idx, (R, t) in poses.items()
+                    },
+                    "components": [list(component) for component in components],
+                    "sparse_points": None,
+                    "point_colors": None,
+                    "point_tracks": [],
+                })
 
         # Multi-view triangulation + filtering using globally refined poses.
         emit_stage(
@@ -445,6 +502,7 @@ class ImageAligner:
         )
         sparse_pts, colors, tracks = self.triangulate_multiview(
             features, pairs, poses, K,
+            min_support_ratio=min_support_ratio,
             progress_callback=stage_callback,
         )
         emit_stage(
@@ -543,7 +601,7 @@ class ImageAligner:
         if focal_override is not None and focal_override > 0:
             f = float(focal_override)
         else:
-            # Common photogrammetry heuristic: ~1.0â€“1.4 Ã— longer side
+            # Common photogrammetry heuristic: ~1.0ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“1.4 ÃƒÆ’Ã¢â‚¬â€ longer side
             f = max(sample.width, sample.height) * 1.15
         cx, cy = sample.width / 2.0, sample.height / 2.0
         return np.array([[f, 0, cx], [0, f, cy], [0, 0, 1]], dtype=np.float64)
@@ -572,8 +630,8 @@ class ImageAligner:
         if max_points <= 0 or reproj_thresh <= 0:
             raise ValueError("max_points and reproj_thresh must be positive.")
 
-        if not 0.5 <= min_support_ratio <= 1.0:
-            raise ValueError("min_support_ratio must be between 0.5 and 1.0.")
+        if not 0.40 <= min_support_ratio <= 1.0:
+            raise ValueError("min_support_ratio must be between 0.40 and 1.0.")
 
         try:
             min_triangulation_angle_deg = float(
@@ -607,6 +665,7 @@ class ImageAligner:
         # ---------------------------------------------------------
         parent = {}
         observations = {}
+        track_build_stats = {"conflicting_unions": 0, "invalid_matches": 0}
 
         def find(node):
             parent.setdefault(node, node)
@@ -626,6 +685,7 @@ class ImageAligner:
                 image_id in or_ and or_[image_id] != kp_id
                 for image_id, kp_id in ol.items()
             ):
+                track_build_stats["conflicting_unions"] += 1
                 return False
 
             parent[rr] = rl
@@ -644,9 +704,12 @@ class ImageAligner:
 
             for match in pair.matches:
                 if (
-                    match.queryIdx >= len(features[pair.idx1].keypoints)
+                    match.queryIdx < 0
+                    or match.trainIdx < 0
+                    or match.queryIdx >= len(features[pair.idx1].keypoints)
                     or match.trainIdx >= len(features[pair.idx2].keypoints)
                 ):
+                    track_build_stats["invalid_matches"] += 1
                     continue
 
                 left = (pair.idx1, match.queryIdx)
@@ -783,27 +846,67 @@ class ImageAligner:
         rejected_tracks = 0
         rejected_observations = 0
         total_tracks = len(tracks_by_root)
+
+        # Diagnostics are observational only: they never influence acceptance.
+        rejection_reasons = {
+            "insufficient_valid_observations": 0,
+            "insufficient_usable_observations": 0,
+            "no_consensus_candidate": 0,
+            "refinement_dlt_failure": 0,
+            "refinement_support_collapse": 0,
+            "refinement_nonconvergence": 0,
+            "final_verification_failure": 0,
+        }
+        candidate_stats = {
+            "candidate_pairs_tested": 0,
+            "parallax_rejections": 0,
+            "candidate_dlt_failures": 0,
+            "candidate_consensus_failures": 0,
+        }
+        accepted_reprojection_errors = []
+        accepted_triangulation_angles = []
+        accepted_observation_counts = []
+        track_lengths = [len(track) for track in tracks_by_root.values()]
         progress_interval = max(1, total_tracks // 100)
+        preview_point_interval = 150
+        last_preview_point_count = 0
         processed_tracks = 0
         stopped_at_point_limit = False
+
+        def emit_triangulation_progress(track_index, message):
+            if progress_callback is None:
+                return
+            progress_callback({
+                "stage": "triangulation",
+                "status": "running",
+                "message": message,
+                "processed_tracks": processed_tracks,
+                "total_tracks": total_tracks,
+                "accepted_points": len(points),
+                "rejected_tracks": rejected_tracks,
+                "progress": processed_tracks / max(total_tracks, 1),
+            })
+
+        def emit_live_point_preview(message):
+            if progress_callback is None:
+                return
+            progress_callback({
+                "stage": "live_preview",
+                "status": "running",
+                "message": message,
+                "sparse_points": np.asarray(points, dtype=np.float64).copy(),
+                "point_colors": np.asarray(colors, dtype=np.uint8).copy(),
+                "point_tracks": list(tracks),
+            })
 
         for track_index, obs in enumerate(tracks_by_root.values(), start=1):
             processed_tracks = track_index - 1
 
-            if progress_callback is not None and (
-                track_index == 1
-                or track_index % progress_interval == 0
-            ):
-                progress_callback({
-                    "stage": "triangulation",
-                    "status": "running",
-                    "message": f"Processing feature track {track_index}/{total_tracks}",
-                    "processed_tracks": processed_tracks,
-                    "total_tracks": total_tracks,
-                    "accepted_points": len(points),
-                    "rejected_tracks": rejected_tracks,
-                    "progress": processed_tracks / max(total_tracks, 1),
-                })
+            if track_index == 1 or track_index % progress_interval == 0:
+                emit_triangulation_progress(
+                    track_index,
+                    f"Processing feature track {track_index}/{total_tracks}",
+                )
 
             valid = [
                 (img_id, kp_id)
@@ -817,6 +920,7 @@ class ImageAligner:
 
             if len(valid) < 2:
                 rejected_tracks += 1
+                rejection_reasons["insufficient_valid_observations"] += 1
                 continue
 
             required_support = max(
@@ -832,6 +936,7 @@ class ImageAligner:
 
             if len(usable) < required_support:
                 rejected_tracks += 1
+                rejection_reasons["insufficient_usable_observations"] += 1
                 continue
 
             # Each candidate pair generates a 3D hypothesis.
@@ -856,11 +961,14 @@ class ImageAligner:
                     ))
                     angle = float(np.degrees(np.arccos(cosine)))
 
+                    candidate_stats["candidate_pairs_tested"] += 1
                     if angle < min_triangulation_angle_deg:
+                        candidate_stats["parallax_rejections"] += 1
                         continue
 
                     candidate = triangulate_dlt([first, second])
                     if candidate is None:
+                        candidate_stats["candidate_dlt_failures"] += 1
                         continue
 
                     inliers, errors = evaluate_observations(
@@ -868,6 +976,7 @@ class ImageAligner:
                     )
 
                     if len(inliers) < required_support:
+                        candidate_stats["candidate_consensus_failures"] += 1
                         continue
 
                     median_error = float(np.median([
@@ -889,6 +998,7 @@ class ImageAligner:
 
             if best_candidate is None:
                 rejected_tracks += 1
+                rejection_reasons["no_consensus_candidate"] += 1
                 continue
 
             # Refine until the point and its supporting observations agree.
@@ -897,10 +1007,12 @@ class ImageAligner:
             final_inliers = None
             final_errors = {}
 
+            refinement_failure = None
             for _ in range(10):
                 refined = triangulate_dlt(inliers)
 
                 if refined is None:
+                    refinement_failure = "refinement_dlt_failure"
                     break
 
                 updated_inliers, updated_errors = evaluate_observations(
@@ -908,6 +1020,7 @@ class ImageAligner:
                 )
 
                 if len(updated_inliers) < required_support:
+                    refinement_failure = "refinement_support_collapse"
                     break
 
                 point = refined
@@ -922,6 +1035,9 @@ class ImageAligner:
 
             if not converged:
                 rejected_tracks += 1
+                rejection_reasons[
+                    refinement_failure or "refinement_nonconvergence"
+                ] += 1
                 continue
 
             # Independently verify that the final point supports exactly
@@ -935,6 +1051,7 @@ class ImageAligner:
                 or set(checked_inliers) != set(final_inliers)
             ):
                 rejected_tracks += 1
+                rejection_reasons["final_verification_failure"] += 1
                 continue
 
             final_inliers = checked_inliers
@@ -947,6 +1064,15 @@ class ImageAligner:
 
             point_id = len(points)
             points.append(point)
+
+            accepted_observation_counts.append(len(final_inliers))
+            accepted_reprojection_errors.extend(
+                float(checked_errors[item])
+                for item in final_inliers
+                if item in checked_errors and np.isfinite(checked_errors[item])
+            )
+            if best_key is not None:
+                accepted_triangulation_angles.append(float(best_key[2]))
 
             rejected_observations += len(valid) - len(final_inliers)
 
@@ -978,8 +1104,69 @@ class ImageAligner:
                 for image_id, keypoint_id in final_inliers
             )
 
+            if len(points) - last_preview_point_count >= preview_point_interval:
+                last_preview_point_count = len(points)
+                emit_live_point_preview(
+                    f"Live sparse reconstruction: {len(points):,} points"
+                )
+
         if not stopped_at_point_limit:
             processed_tracks = total_tracks
+
+        if progress_callback is not None and points:
+            emit_live_point_preview(
+                f"Initial sparse reconstruction complete: {len(points):,} points"
+            )
+
+        def diagnostic_percentiles(values):
+            if not values:
+                return {"min": None, "median": None, "p90": None, "p95": None, "max": None}
+            array = np.asarray(values, dtype=np.float64)
+            return {
+                "min": float(np.min(array)),
+                "median": float(np.median(array)),
+                "p90": float(np.percentile(array, 90)),
+                "p95": float(np.percentile(array, 95)),
+                "max": float(np.max(array)),
+            }
+
+        track_length_distribution = {}
+        for length in track_lengths:
+            key = str(length)
+            track_length_distribution[key] = track_length_distribution.get(key, 0) + 1
+
+        diagnostics = {
+            "total_tracks": int(total_tracks),
+            "accepted_points": int(len(points)),
+            "rejected_tracks": int(rejected_tracks),
+            "rejected_observations": int(rejected_observations),
+            "track_build": {
+                **track_build_stats,
+                "track_length_distribution": track_length_distribution,
+                "track_length_percentiles": diagnostic_percentiles(track_lengths),
+            },
+            "candidate_generation": candidate_stats,
+            "rejection_reasons": rejection_reasons,
+            "accepted_points_quality": {
+                "reprojection_error_px": diagnostic_percentiles(accepted_reprojection_errors),
+                "best_candidate_triangulation_angle_deg": diagnostic_percentiles(accepted_triangulation_angles),
+                "observations_per_point": diagnostic_percentiles(accepted_observation_counts),
+            },
+            "thresholds": {
+                "min_support_ratio": float(min_support_ratio),
+                "reprojection_threshold_px": float(reproj_thresh),
+                "min_triangulation_angle_deg": float(min_triangulation_angle_deg),
+            },
+            "stopped_at_point_limit": bool(stopped_at_point_limit),
+        }
+
+        if progress_callback is not None:
+            progress_callback({
+                "stage": "triangulation_diagnostics",
+                "status": "completed",
+                "message": "Triangulation diagnostics report",
+                "diagnostics": diagnostics,
+            })
 
         if progress_callback is not None:
             progress_callback({
@@ -1580,6 +1767,63 @@ class ImageAligner:
                 y = (m[1,2] + m[2,1]) / s
                 z = 0.25 * s
         return np.array([w, x, y, z])
+
+
+    def export_colmap_component(
+        self,
+        result: AlignmentResult,
+        component_index: int,
+        output_dir: str,
+        K: np.ndarray,
+        images_dir: Optional[str] = None,
+    ) -> str:
+        """Export a single connected component as an independent COLMAP text model.
+
+        Cameras, points and tracks are filtered to those belonging to the
+        requested component. No cross-component transform is applied.
+        """
+        if not (0 <= component_index < len(result.components)):
+            raise ValueError(f"component_index {component_index} out of range")
+
+        component = set(result.components[component_index])
+        # Build a filtered result that contains only this component.
+        filtered_features = result.features  # keep original list; export filters by pose
+        filtered_poses = {
+            idx: pose for idx, pose in result.camera_poses.items()
+            if idx in component
+        }
+        # Points whose supporting tracks are entirely inside the component.
+        keep_point_ids = set()
+        if result.point_tracks:
+            for point_id, image_idx, _kp in result.point_tracks:
+                if image_idx in component:
+                    keep_point_ids.add(point_id)
+
+        filtered_points = None
+        filtered_colors = None
+        filtered_tracks = None
+        if result.sparse_points is not None and keep_point_ids:
+            id_map = {old: new for new, old in enumerate(sorted(keep_point_ids))}
+            filtered_points = result.sparse_points[sorted(keep_point_ids)]
+            if result.point_colors is not None:
+                filtered_colors = result.point_colors[sorted(keep_point_ids)]
+            filtered_tracks = [
+                (id_map[pid], img, kp)
+                for pid, img, kp in result.point_tracks
+                if pid in keep_point_ids and img in component
+            ]
+
+        filtered = AlignmentResult(
+            features=filtered_features,
+            pairs=[p for p in result.pairs if p.idx1 in component and p.idx2 in component],
+            components=[result.components[component_index]],
+            camera_poses=filtered_poses,
+            sparse_points=filtered_points,
+            point_colors=filtered_colors,
+            point_tracks=filtered_tracks,
+            camera_matrix=result.camera_matrix,
+        )
+        return self.export_colmap(filtered, output_dir, K, images_dir=images_dir)
 
 
 def visualize_matches(

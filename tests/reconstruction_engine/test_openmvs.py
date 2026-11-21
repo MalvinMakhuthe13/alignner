@@ -1,4 +1,4 @@
-﻿from pathlib import Path
+from pathlib import Path
 
 import pytest
 
@@ -52,7 +52,9 @@ def test_densify_command(openmvs, config):
     assert "scene.mvs" in command
     assert "--resolution-level" in command
     assert "--number-views" in command
-    assert "--number-views-fuse" not in command
+    assert "--number-views-fuse" in command
+    fuse_index = command.index("--number-views-fuse")
+    assert command[fuse_index + 1] == str(config.densify_num_views_fuse)
     assert "--estimate-colors" in command
     assert "--max-threads" in command
 
@@ -107,4 +109,5 @@ def test_missing_executable_raises_error(tmp_path):
             "scene.mvs",
             ReconstructionConfig(),
         )
+
 
