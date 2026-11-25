@@ -1,3 +1,4 @@
+"""Legacy pairwise aligner (kept for reference). The app now uses src/sfm.py."""
 """
 Alignner - Image Alignment for Photogrammetry
 Inspired by RealityScan / RealityCapture alignment pipeline.

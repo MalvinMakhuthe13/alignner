@@ -1,46 +1,60 @@
 """
-Alignner App - Image & Video Alignment with conservative intelligent selection.
+Alignner — photo & video alignment for photogrammetry and Gaussian splatting.
+
+Upload photos or a video, align them (real incremental SfM with bundle
+adjustment), check the cameras and sparse points, then download a COLMAP
+folder that Brush, gsplat or Nerfstudio train on directly.
 """
-import streamlit as st
-import numpy as np
-import cv2
-from pathlib import Path
+import io
+import shutil
 import tempfile
-import json
+import zipfile
+from pathlib import Path
+
+import cv2
+import numpy as np
 import plotly.graph_objects as go
-from src.aligner import ImageAligner, visualize_matches
+import streamlit as st
+
 from src.image_selector import IntelligentImageSelector
+from src.sfm import IncrementalSfM, camera_center, export_colmap
 
 st.set_page_config(page_title="Alignner", page_icon="📷", layout="wide")
 st.title("📷 Alignner")
 st.markdown("""
-**Image & Video Alignment for Photogrammetry**
-Upload photos or videos. Optionally run a conservative image-selection preflight
-before alignment. Original uploads are never modified.
+**Alignment for photogrammetry and Gaussian splatting.**
+Upload photos or videos → **Align** → download a COLMAP folder for Brush.
+Original uploads are never modified.
 """)
 
-st.sidebar.header("Settings")
-detector = st.sidebar.selectbox("Feature Detector", ["orb", "sift"], index=0)
-max_features = st.sidebar.slider("Max Features / Image", 1000, 12000, 5000, step=500)
-match_ratio = st.sidebar.slider("Lowe's Ratio", 0.5, 0.9, 0.75, 0.05)
-min_inliers = st.sidebar.slider("Min Inliers", 8, 80, 15)
-focal_override = st.sidebar.number_input("Focal Length (px, 0=auto)", 0.0, step=50.0)
+st.sidebar.header("Alignment")
+detector = st.sidebar.selectbox("Features", ["sift", "orb"], index=0,
+                                help="SIFT is slower but far more accurate. Use ORB only for quick previews.")
+max_features = st.sidebar.slider("Features per image", 2000, 16000, 8000, step=1000)
+match_ratio = st.sidebar.slider("Match strictness (Lowe ratio)", 0.6, 0.9, 0.8, 0.05,
+                                help="Lower = stricter, fewer but cleaner matches.")
+min_inliers = st.sidebar.slider("Min verified matches per pair", 15, 100, 30)
+focal_override = st.sidebar.number_input("Focal length (px, 0 = from EXIF / auto)", 0.0, step=50.0,
+                                         help="Leave at 0. Focal is read from EXIF and then refined.")
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("Large sets")
-st.sidebar.caption("The aligner uses nearby + sparse long-range matching for larger sets.")
-fps_extract = st.sidebar.slider("Extract every Nth frame (or FPS)", 1, 30, 5)
-max_frames = st.sidebar.slider("Max frames per video", 10, 200, 60)
+exhaustive_limit = st.sidebar.slider("Match every pair up to N images", 20, 150, 60,
+                                     help="Above this, nearby images plus visual retrieval are matched.")
+window = st.sidebar.slider("Sequential neighbours", 4, 30, 12)
+fps_extract = st.sidebar.slider("Video: keep every Nth frame", 1, 30, 10)
+max_frames = st.sidebar.slider("Video: max frames", 10, 400, 150)
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("Intelligent selection")
-use_selection = st.sidebar.checkbox("Enable conservative duplicate removal", value=False,
+use_selection = st.sidebar.checkbox("Remove strong near-duplicates", value=False,
     help="Only very strong near-duplicates are excluded. Blurry/low-feature images are flagged for review, not discarded.")
 review_threshold = st.sidebar.slider("Flag blur below (Laplacian variance)", 5.0, 80.0, 18.0, 1.0)
 
 tab1, tab2 = st.tabs(["Images", "Videos"])
-image_files = tab1.file_uploader("Upload images", type=["jpg", "jpeg", "png", "webp"], accept_multiple_files=True)
+image_files = tab1.file_uploader("Upload images", type=["jpg", "jpeg", "png", "webp", "tif", "tiff"], accept_multiple_files=True)
 video_files = tab2.file_uploader("Upload videos", type=["mp4", "mov", "avi", "mkv", "webm"], accept_multiple_files=True)
+
 
 def extract_frames(video_bytes: bytes, filename: str, every_n: int, max_n: int, tmpdir: Path):
     safe_name = Path(filename).name
@@ -52,7 +66,7 @@ def extract_frames(video_bytes: bytes, filename: str, every_n: int, max_n: int, 
         return []
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = cap.get(cv2.CAP_PROP_FPS) or 30
-    st.info(f"{filename}: {total} frames @ {fps:.1f} fps → sampling every {every_n} frames (max {max_n})")
+    st.info(f"{filename}: {total} frames @ {fps:.1f} fps → every {every_n} frames (max {max_n})")
     frames, idx, saved = [], 0, 0
     while saved < max_n:
         ret, frame = cap.read()
@@ -60,171 +74,134 @@ def extract_frames(video_bytes: bytes, filename: str, every_n: int, max_n: int, 
             break
         if idx % every_n == 0:
             out_path = tmpdir / f"{Path(filename).stem}_frame_{saved:04d}.jpg"
-            cv2.imwrite(str(out_path), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+            cv2.imwrite(str(out_path), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
             frames.append(str(out_path))
             saved += 1
         idx += 1
     cap.release()
     return frames
 
+
+def zip_folder(folder: Path) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for p in sorted(folder.rglob("*")):
+            if p.is_file():
+                z.write(p, p.relative_to(folder.parent))
+    return buf.getvalue()
+
+
 if st.button("🚀 Align", type="primary"):
     tmpdir = Path(tempfile.mkdtemp(prefix="alignner_"))
+    src_dir = tmpdir / "input"
+    src_dir.mkdir()
     all_paths = []
     with st.spinner("Preparing images and extracting video frames..."):
         for f in image_files or []:
-            p = tmpdir / Path(f.name).name
+            p = src_dir / Path(f.name).name
             p.write_bytes(f.getvalue())
             all_paths.append(str(p))
         for vf in video_files or []:
-            all_paths.extend(extract_frames(vf.getvalue(), vf.name, fps_extract, max_frames, tmpdir))
+            all_paths.extend(extract_frames(vf.getvalue(), vf.name, fps_extract, max_frames, src_dir))
 
     if len(all_paths) < 2:
         st.error("Need at least 2 images/frames to align.")
     else:
         original_count = len(all_paths)
-        selection = None
         if use_selection:
             with st.spinner(f"Analysing {original_count} images for quality and near-duplicates..."):
-                selector = IntelligentImageSelector(min_sharpness_for_review=review_threshold)
-                selection = selector.analyze(all_paths)
+                selection = IntelligentImageSelector(min_sharpness_for_review=review_threshold).analyze(all_paths)
                 all_paths = selection.selected_paths
             st.session_state["selection_result"] = selection
             st.session_state["selection_csv"] = str(tmpdir / "selection_manifest.csv")
             selection.to_csv(st.session_state["selection_csv"])
-            st.info(f"Selection retained {selection.selected_count}/{original_count} images; "
-                    f"{len(selection.excluded_paths)} strong near-duplicates excluded. "
-                    "Review-flagged images remain included.")
+            st.info(f"Selection retained {selection.selected_count}/{original_count} images.")
 
-        if len(all_paths) < 2:
-            st.error("Fewer than 2 images remain. Disable selection or add more images.")
-        else:
-            with st.spinner(f"Aligning {len(all_paths)} images/frames..."):
-                progress_bar = st.progress(0)
-                status_text = st.empty()
-                def update_progress(frac, msg):
-                    progress_bar.progress(min(1.0, float(frac)))
-                    status_text.caption(msg)
-                aligner = ImageAligner(feature_detector=detector, max_features=max_features,
-                                       match_ratio=match_ratio, min_inliers=min_inliers)
-                focal = float(focal_override) if focal_override > 0 else None
-                result = aligner.align(all_paths, focal_length=focal, progress_callback=update_progress)
-                progress_bar.progress(1.0)
-                status_text.caption("Finished")
-            st.session_state["alignment_result"] = result
-            st.session_state["alignment_done"] = True
+        progress_bar = st.progress(0.0)
+        status_text = st.empty()
+
+        def update_progress(frac, msg):
+            progress_bar.progress(min(1.0, float(frac)))
+            status_text.caption(msg)
+
+        sfm = IncrementalSfM(detector=detector, max_features=max_features, ratio=match_ratio,
+                             min_inliers=min_inliers, exhaustive_limit=exhaustive_limit,
+                             sequential_window=window,
+                             focal_px=float(focal_override) if focal_override > 0 else None,
+                             progress=update_progress)
+        try:
+            with st.spinner(f"Aligning {len(all_paths)} images..."):
+                rec = sfm.run(all_paths)
+            out_dir = tmpdir / "colmap"
+            info = export_colmap(rec, str(out_dir))
+            st.session_state["rec"] = rec
+            st.session_state["export"] = (str(out_dir), info)
+        except ValueError as e:
+            st.error(str(e))
+            st.session_state.pop("rec", None)
 
 if "selection_result" in st.session_state:
     selection = st.session_state["selection_result"]
-    st.subheader("Intelligent selection report")
-    a, b, c = st.columns(3)
-    a.metric("Input images", selection.input_count)
-    b.metric("Retained", selection.selected_count)
-    c.metric("Excluded duplicates", len(selection.excluded_paths))
-    st.caption("Review items are retained. Only strong near-duplicates are automatically excluded.")
-    rows = [{
-        "Image": x.filename, "Decision": x.decision, "Quality": x.quality_score,
-        "Sharpness": x.sharpness, "Features": x.feature_count, "Reason": x.reason
-    } for x in selection.assessments]
-    st.dataframe(rows, use_container_width=True, hide_index=True)
-    csv_path = st.session_state.get("selection_csv")
-    if csv_path and Path(csv_path).exists():
-        st.download_button("Download selection manifest (CSV)", Path(csv_path).read_bytes(),
-                           file_name="alignner_selection_manifest.csv", mime="text/csv")
+    with st.expander("Intelligent selection report"):
+        rows = [{"Image": x.filename, "Decision": x.decision, "Quality": x.quality_score,
+                 "Sharpness": x.sharpness, "Features": x.feature_count, "Reason": x.reason}
+                for x in selection.assessments]
+        st.dataframe(rows, use_container_width=True, hide_index=True)
+        csv_path = st.session_state.get("selection_csv")
+        if csv_path and Path(csv_path).exists():
+            st.download_button("Download selection manifest (CSV)", Path(csv_path).read_bytes(),
+                               file_name="alignner_selection_manifest.csv", mime="text/csv")
 
-if st.session_state.get("alignment_done") and "alignment_result" in st.session_state:
-    result = st.session_state["alignment_result"]
-    st.success(f"Done — {len(result.features)} images, {len(result.pairs)} verified pairs")
+if "rec" in st.session_state:
+    rec = st.session_state["rec"]
+    out_dir, info = st.session_state["export"]
+    s = rec.stats()
+    st.success(f"Aligned {s['registered']} of {s['images']} images · {s['points']:,} sparse points")
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Images / Frames", len(result.features))
-    c2.metric("Verified Pairs", len(result.pairs))
-    c3.metric("Components", len(result.components))
-    c4.metric("Largest Component", max((len(c) for c in result.components), default=0))
+    c1.metric("Cameras placed", f"{s['registered']}/{s['images']}")
+    c2.metric("Sparse points", f"{s['points']:,}")
+    c3.metric("Mean reprojection error", f"{s['mean_reprojection_error_px'] or 0:.2f} px",
+              help="Under 1 px is excellent; under 2 px is good for splatting.")
+    c4.metric("Mean track length", f"{s['mean_track_length'] or 0:.1f} views")
+    cams = ", ".join(f"{c.width}×{c.height} f={c.f:.0f}px k={c.k:+.3f}" for c in rec.cameras.values())
+    st.caption(f"Lens: {cams}" + (" · images were undistorted for training" if info["undistorted"] else ""))
 
-    st.subheader("Connected Components")
-    for i, comp in enumerate(result.components):
-        names = [Path(result.features[j].path).name for j in comp]
-        st.write(f"**Component {i+1}** ({len(comp)}): {', '.join(names[:8])}{'...' if len(names)>8 else ''}")
+    st.download_button("⬇️ Download COLMAP folder for Brush (.zip)", zip_folder(Path(out_dir)),
+                       file_name="alignner_colmap.zip", mime="application/zip", type="primary")
+    st.caption("Unzip and open the `colmap` folder in Brush (it contains `images/` and `sparse/0/`).")
 
-    if result.pairs:
-        st.subheader("Browse Matches")
-        sorted_pairs = sorted(result.pairs, key=lambda x: -x.inliers)
-        pair_options = [f"{Path(result.features[p.idx1].path).name} ↔ {Path(result.features[p.idx2].path).name} ({p.inliers} inliers)" for p in sorted_pairs]
-        if "match_idx" not in st.session_state:
-            st.session_state.match_idx = 0
-        col_prev, col_sel, col_next = st.columns([1, 6, 1])
-        with col_prev:
-            if st.button("← Prev", disabled=st.session_state.match_idx <= 0):
-                st.session_state.match_idx = max(0, st.session_state.match_idx - 1)
-                st.rerun()
-        with col_next:
-            if st.button("Next →", disabled=st.session_state.match_idx >= len(pair_options)-1):
-                st.session_state.match_idx = min(len(pair_options)-1, st.session_state.match_idx + 1)
-                st.rerun()
-        with col_sel:
-            selected_pair = st.selectbox("Select a matched pair", pair_options,
-                                         index=st.session_state.match_idx, key="pair_select")
-            new_idx = pair_options.index(selected_pair)
-            if new_idx != st.session_state.match_idx:
-                st.session_state.match_idx = new_idx
-                st.rerun()
-        chosen = sorted_pairs[st.session_state.match_idx]
-        f1, f2 = result.features[chosen.idx1], result.features[chosen.idx2]
-        if f1.image is not None and f2.image is not None:
-            vis = visualize_matches(f1.image, f1.keypoints, f2.image, f2.keypoints,
-                                    chosen.matches, max_draw=100)
-            st.image(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB), caption=f"{chosen.inliers} inliers",
-                     use_container_width=True)
-            st.caption(f"Pair {st.session_state.match_idx+1} of {len(sorted_pairs)} • Green lines = verified matches")
+    st.subheader("Cameras + sparse points")
+    fig = go.Figure()
+    reg = rec.registered_views
+    if reg:
+        pos = np.array([camera_center(v) for v in reg])
+        fig.add_trace(go.Scatter3d(x=pos[:, 0], y=pos[:, 1], z=pos[:, 2], mode="markers",
+                                   marker=dict(size=4, color="#c8ff00"), name="Cameras",
+                                   text=[Path(v.path).name for v in reg]))
+    pts = rec.points
+    if pts:
+        ix = np.random.default_rng(0).choice(len(pts), min(40000, len(pts)), replace=False)
+        P = np.array([pts[i].xyz for i in ix])
+        C = np.array([pts[i].color for i in ix])
+        fig.add_trace(go.Scatter3d(x=P[:, 0], y=P[:, 1], z=P[:, 2], mode="markers",
+                                   marker=dict(size=1.6, color=[f"rgb({r},{g},{b})" for r, g, b in C]),
+                                   name="Sparse points"))
+    fig.update_layout(scene=dict(aspectmode="data"), height=700, margin=dict(l=0, r=0, b=0, t=30))
+    st.plotly_chart(fig, use_container_width=True)
 
-    if result.camera_poses or result.sparse_points is not None:
-        st.subheader("Cameras + Sparse Points")
-        fig = go.Figure()
-        if result.camera_poses:
-            positions = []
-            for idx in sorted(result.camera_poses):
-                R, t = result.camera_poses[idx]
-                positions.append(-R.T @ t.flatten())
-            if positions:
-                pos = np.array(positions)
-                fig.add_trace(go.Scatter3d(x=pos[:,0], y=pos[:,1], z=pos[:,2],
-                    mode="markers+lines", marker=dict(size=4), line=dict(width=4), name="Camera path"))
-        if result.sparse_points is not None and len(result.sparse_points):
-            pts = result.sparse_points
-            if len(pts) > 20000:
-                ix = np.random.choice(len(pts), 20000, replace=False)
-                pts = pts[ix]
-                cols = result.point_colors[ix] if result.point_colors is not None else None
-            else:
-                cols = result.point_colors
-            fig.add_trace(go.Scatter3d(x=pts[:,0], y=pts[:,1], z=pts[:,2], mode="markers",
-                marker=dict(size=1.8, color=cols if cols is not None else "orange", opacity=0.65),
-                name="Sparse points"))
-        fig.add_trace(go.Scatter3d(x=[0], y=[0], z=[0], mode="markers",
-            marker=dict(size=8, symbol="diamond"), name="Origin"))
-        fig.update_layout(scene=dict(aspectmode="data", xaxis_title="X", yaxis_title="Y", zaxis_title="Z"),
-                          height=700, margin=dict(l=0, r=0, b=0, t=30))
-        st.plotly_chart(fig, use_container_width=True)
-        st.caption(f"{len(result.camera_poses)} cameras posed • "
-                   f"{0 if result.sparse_points is None else len(result.sparse_points)} sparse points.")
-
-    st.subheader("Browse Images")
-    if result.features:
-        names = [Path(f.path).name for f in result.features]
-        selected = st.selectbox("Select image", names, index=0)
-        feat = result.features[names.index(selected)]
-        if feat.image is not None:
-            ca, cb = st.columns([2, 1])
-            with ca:
-                st.image(cv2.cvtColor(feat.image, cv2.COLOR_BGR2RGB), caption=selected, use_container_width=True)
-            with cb:
-                st.write(f"**Size:** {feat.width} × {feat.height}")
-                st.write(f"**Features:** {len(feat.keypoints)}")
-                st.write(f"**Pose recovered:** {'Yes' if names.index(selected) in result.camera_poses else 'No'}")
+    unplaced = [Path(v.path).name for v in rec.views if not v.registered]
+    if unplaced:
+        st.warning(f"{len(unplaced)} image(s) could not be placed: {', '.join(unplaced[:20])}"
+                   f"{'…' if len(unplaced) > 20 else ''}. They usually lack overlap with the rest — "
+                   "add photos in between or re-shoot with 60–80 % overlap.")
+    with st.expander("Alignment log"):
+        st.code("\n".join(rec.log) or "—")
 
     if st.button("Clear results"):
-        for key in ("alignment_result", "alignment_done", "selection_result", "selection_csv", "match_idx"):
+        shutil.rmtree(Path(out_dir).parent, ignore_errors=True)
+        for key in ("rec", "export", "selection_result", "selection_csv"):
             st.session_state.pop(key, None)
         st.rerun()
 
 st.markdown("---")
-st.caption("Alignner prototype • Selection is conservative and opt-in • Full SfM / production COLMAP export remains separate")
+st.caption("Alignner · incremental SfM + bundle adjustment on the CPU · COLMAP export for Brush / gsplat / Nerfstudio")
