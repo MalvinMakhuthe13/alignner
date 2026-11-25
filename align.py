@@ -3,6 +3,7 @@ Command-line alignment: a folder of photos → a COLMAP folder for Brush.
 
     python align.py photos/ out/
     python align.py photos/ out/ --features 12000 --focal 3100
+    python align.py drone/ out/ --gps --level z --clean
 
 The output folder contains images/ and sparse/0/ (binary + text) and
 sparse_points.ply. Open it in Brush to train the splat.
@@ -29,6 +30,9 @@ def main(argv=None) -> int:
     ap.add_argument("--focal", type=float, default=None, help="focal length in pixels (default: EXIF, then refined)")
     ap.add_argument("--exhaustive-limit", type=int, default=60)
     ap.add_argument("--window", type=int, default=12)
+    ap.add_argument("--level", choices=["y", "z"], help="level the scene: y-up (Fumoca/Brush) or z-up (RealityScan/Blender), and centre it")
+    ap.add_argument("--gps", action="store_true", help="scale to metres and orient east-north-up from photo GPS")
+    ap.add_argument("--clean", action="store_true", help="drop stray sparse points (statistical outliers)")
     ap.add_argument("-q", "--quiet", action="store_true")
     a = ap.parse_args(argv)
 
@@ -51,6 +55,16 @@ def main(argv=None) -> int:
     except ValueError as e:
         print(str(e), file=sys.stderr)
         return 1
+    from src import scene_tools as T
+    if a.gps:
+        try:
+            print("GPS:", T.georeference_from_gps(rec))
+        except ValueError as e:
+            print(f"GPS skipped: {e}", file=sys.stderr)
+    if a.level:
+        T.level_scene(rec, up_axis=a.level)
+    if a.clean:
+        print(f"Removed {T.clean_points(rec):,} stray points")
     info = export_colmap(rec, a.out)
     print(json.dumps({**rec.stats(), **info}, indent=2))
     return 0
