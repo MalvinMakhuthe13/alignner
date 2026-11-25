@@ -33,10 +33,17 @@ def main(argv=None) -> int:
     a = ap.parse_args(argv)
 
     logging.basicConfig(level=logging.WARNING if a.quiet else logging.INFO, format="%(message)s")
-    paths = sorted(str(p) for p in Path(a.images).iterdir() if p.suffix.lower() in EXTS)
-    if len(paths) < 2:
-        print("Need at least two photos.", file=sys.stderr)
+    folder = Path(a.images).expanduser()
+    if not folder.is_dir():
+        print(f"Photo folder not found: {folder}\n"
+              "Tip: in File Explorer, open your photo folder, click the address bar, copy the path "
+              "and paste it here in quotes.", file=sys.stderr)
         return 2
+    paths = sorted(str(p) for p in folder.iterdir() if p.suffix.lower() in EXTS)
+    if len(paths) < 2:
+        print(f"Found {len(paths)} photo(s) in {folder}; need at least two (.jpg, .png, .tif, .webp).", file=sys.stderr)
+        return 2
+    print(f"Aligning {len(paths)} photos from {folder} ...")
     sfm = IncrementalSfM(detector=a.detector, max_features=a.features, ratio=a.ratio, min_inliers=a.min_inliers,
                          focal_px=a.focal, exhaustive_limit=a.exhaustive_limit, sequential_window=a.window)
     try:
