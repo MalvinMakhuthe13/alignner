@@ -21,7 +21,7 @@ import streamlit as st
 from src.image_selector import IntelligentImageSelector
 from src.sfm import IncrementalSfM, camera_center, export_colmap
 from src import scene_tools as T
-from src.dense import densify, write_ply
+from src.dense import densify, write_ply, brush_cloud, DenseCloud
 
 st.set_page_config(page_title="Alignner", page_icon="📷", layout="wide", initial_sidebar_state="expanded")
 
@@ -374,14 +374,36 @@ with t_export:
         out_dir = Path(ss["out_dir"])
         st.markdown('<div class="an-step">The COLMAP folder opens directly in Brush (and gsplat, Nerfstudio, COLMAP). Scene edits from ④ are included.</div>', unsafe_allow_html=True)
         dense = ss.get("dense")
-        add_dense = dense is not None and st.checkbox(f"Start Brush from the dense cloud ({len(dense):,} points) — better first look and detail", True)
-        if dense is None:
-            st.caption("Tip: build the dense cloud in ④ Scene for a cleaner start in Brush.")
+        start = st.radio("Starting points for Brush", [
+            "Brush-ready: even, clean, small gaps filled (recommended)",
+            "Everything: sparse + full dense cloud",
+            "Sparse points only"], index=0,
+            help="Brush trains faster and cleaner from evenly spread points that already cover the object.")
+        target = st.select_slider("Brush-ready size", [100_000, 200_000, 300_000, 500_000, 800_000], 300_000,
+                                  format_func=lambda n: f"{n // 1000}k points") if start.startswith("Brush") else None
+        if dense is None and not start.startswith("Sparse"):
+            st.caption("Tip: build the dense cloud in ④ Scene first — the Brush-ready cloud uses it to fill the surface.")
+        add_dense = dense is not None and start.startswith("Everything")
         if st.button("Prepare export", type="primary"):
             if out_dir.exists():
                 shutil.rmtree(out_dir)
             with st.spinner("Writing COLMAP model and images…"):
-                info = export_colmap(rec, str(out_dir), extra_points=(dense.points, dense.colors) if add_dense else None)
+                extra, binfo = None, None
+                if start.startswith("Brush"):
+                    try:
+                        bp, bc, binfo = brush_cloud(rec, dense, target=target)
+                        extra = (bp, bc)
+                    except ValueError as e:
+                        st.error(str(e))
+                elif add_dense:
+                    extra = (dense.points, dense.colors)
+                info = export_colmap(rec, str(out_dir), extra_points=extra)
+                if binfo:
+                    write_ply(str(out_dir / "brush_points.ply"), DenseCloud(points=extra[0], colors=extra[1], support=np.zeros(len(extra[0]), np.int32), pairs_used=0))
+                    ss["export_brush"] = (out_dir / "brush_points.ply").read_bytes()
+                    info["brush"] = binfo
+                else:
+                    ss.pop("export_brush", None)
                 if dense is not None:
                     write_ply(str(out_dir / "dense_points.ply"), dense)
                     ss["export_dense"] = (out_dir / "dense_points.ply").read_bytes()
@@ -396,10 +418,14 @@ with t_export:
                 ss["export_log_len"] = len(ss.get("scene_log", []))
         if "export_zip" in ss:
             info = ss["export_info"]
-            st.success(f"{info['images']} cameras · {info['points']:,} sparse points" + (f" + {info['dense_points']:,} dense" if info.get('dense_points') else "")
+            b = info.get("brush")
+            st.success(f"{info['images']} cameras · {info['points']:,} sparse points"
+                       + (f" + {b['points']:,} Brush-ready points (even spacing, {b['gaps_filled']:,} gaps filled)" if b else (f" + {info['dense_points']:,} dense" if info.get('dense_points') else ""))
                        + (" · images undistorted for training" if info["undistorted"] else ""))
             c = st.columns(4)
-            if ss.get("export_dense"):
+            if ss.get("export_brush"):
+                c[3].download_button("⬇️ Brush-ready cloud (.ply)", ss["export_brush"], "brush_points.ply")
+            elif ss.get("export_dense"):
                 c[3].download_button("⬇️ Dense cloud (.ply)", ss["export_dense"], "dense_points.ply")
             c[0].download_button("⬇️ COLMAP folder for Brush (.zip)", ss["export_zip"], "alignner_colmap.zip", "application/zip", type="primary")
             c[1].download_button("⬇️ Sparse point cloud (.ply)", ss["export_ply"], "sparse_points.ply")

@@ -238,8 +238,35 @@ class IncrementalSfM:
 
     def _detector(self):
         if self.detector_name == "orb":
-            return cv2.ORB_create(nfeatures=self.max_features, scaleFactor=1.2, nlevels=8)
-        return cv2.SIFT_create(nfeatures=self.max_features)
+            return cv2.ORB_create(nfeatures=self.max_features * 3, scaleFactor=1.2, nlevels=8)
+        # detect generously (incl. low-contrast detail), then spread evenly below
+        return cv2.SIFT_create(nfeatures=self.max_features * 3, contrastThreshold=0.02)
+
+    def _spread(self, kps, desc, w: int, h: int):
+        """Keep `max_features`, spread evenly over the photo: each cell of a grid
+        gets an equal share of its strongest features, the rest go to the
+        strongest overall. Plain "strongest N" clusters on busy texture and
+        leaves plain areas empty — uneven, gappy sparse clouds."""
+        n = len(kps)
+        if n <= self.max_features:
+            return kps, desc
+        gx, gy = 16, max(4, round(16 * h / max(1, w)))
+        resp = np.array([k.response for k in kps]); pts = np.array([k.pt for k in kps])
+        cell = (np.minimum(gy - 1, (pts[:, 1] * gy / h).astype(int)) * gx + np.minimum(gx - 1, (pts[:, 0] * gx / w).astype(int)))
+        quota = max(1, int(self.max_features * 0.7) // (gx * gy))
+        order = np.lexsort((-resp, cell))                  # by cell, strongest first
+        rank = np.empty(n, int); start = 0
+        sc = cell[order]
+        for i in range(n):
+            if i == 0 or sc[i] != sc[i - 1]: start = i
+            rank[order[i]] = i - start
+        keep = rank < quota
+        rest = np.where(~keep)[0]
+        extra = self.max_features - int(keep.sum())
+        if extra > 0 and len(rest):
+            keep[rest[np.argsort(-resp[rest])[:extra]]] = True
+        idx = np.where(keep)[0]
+        return [kps[i] for i in idx], desc[idx]
 
     # -- 1+2 features & cameras ---------------------------------------------
     def extract(self, paths: List[str]) -> Tuple[Dict[int, Camera], List[View]]:
@@ -256,6 +283,8 @@ class IncrementalSfM:
             small = cv2.resize(img, (round(w * s), round(h * s)), interpolation=cv2.INTER_AREA) if s < 1 else img
             gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
             kps, desc = det.detectAndCompute(gray, None)
+            if desc is not None and len(kps):
+                kps, desc = self._spread(kps, desc, gray.shape[1], gray.shape[0])
             if desc is None or len(kps) < 50:
                 self._note(f"skipped {Path(path).name}: only {0 if kps is None else len(kps)} features")
                 continue

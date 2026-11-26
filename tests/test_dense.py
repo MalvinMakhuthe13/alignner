@@ -46,3 +46,25 @@ def test_dense_cloud_hugs_the_surfaces():
 if __name__ == "__main__":
     test_dense_cloud_hugs_the_surfaces()
     print("dense: all tests passed")
+
+
+def test_brush_cloud_even_and_on_target(tmp_path):
+    import numpy as np
+    from src.dense import even_cloud, fill_small_gaps, remove_outliers
+    rng = np.random.default_rng(0)
+    # a plane with a dense clump, a sparse half, pin-holes and a few strays
+    P = np.concatenate([rng.random((40000, 2)) * [1, 1], rng.random((20000, 2)) * [0.2, 0.2]])
+    P = np.c_[P, np.zeros(len(P))].astype(np.float32)
+    holes = (np.hypot(P[:, 0] - 0.7, P[:, 1] - 0.7) < 0.01)
+    P = P[~holes]
+    stray = (rng.random((50, 3)) * 5 + 3).astype(np.float32)
+    P = np.concatenate([P, stray]); C = np.full((len(P), 3), 128, np.uint8)
+    keep = remove_outliers(P, k=10, std=2.0)
+    assert keep[-50:].sum() == 0 and keep[:-50].mean() > 0.98
+    E, EC, vox = even_cloud(P[keep], C[keep], 5000)
+    assert 4000 < len(E) < 6000 and vox > 0
+    # even: the clump no longer has many times the density
+    clump = ((E[:, 0] < 0.2) & (E[:, 1] < 0.2)).mean()
+    assert clump < 0.07, clump
+    F, FC, added = fill_small_gaps(E, EC, vox)
+    assert added > 0 and len(F) == len(E) + added and np.all(np.abs(F[:, 2]) < 1e-5)

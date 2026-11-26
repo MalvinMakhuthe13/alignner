@@ -52,7 +52,7 @@ def _shared_points(rec: Reconstruction) -> Dict[Tuple[int, int], List[np.ndarray
     return shared
 
 
-def choose_pairs(rec: Reconstruction, per_image: int = 2, min_angle: float = 4.0, max_angle: float = 28.0,
+def choose_pairs(rec: Reconstruction, per_image: int = 3, min_angle: float = 4.0, max_angle: float = 32.0,
                  min_shared: int = 40) -> List[Tuple[int, int]]:
     """Best stereo partners per image: many shared points and a useful baseline angle."""
     shared = _shared_points(rec)
@@ -96,7 +96,9 @@ def _stereo_pair(rec: Reconstruction, ia: int, ib: int, max_side: int, step: int
     Rb, tb = _pose(vb)
     R = Rb @ Ra.T
     T = (tb - R @ ta).reshape(3, 1)
-    R1, R2, P1, P2, Q, _, _ = cv2.stereoRectify(Ka, Da, Kb, Db, size, R, T, flags=cv2.CALIB_ZERO_DISPARITY, alpha=0)
+    # alpha=1 keeps the whole frame: alpha=0 cropped converging pairs to their
+    # centre and lost the outer parts of the scene (black borders are masked below)
+    R1, R2, P1, P2, Q, _, _ = cv2.stereoRectify(Ka, Da, Kb, Db, size, R, T, flags=cv2.CALIB_ZERO_DISPARITY, alpha=1)
     if abs(P2[1, 3]) > abs(P2[0, 3]):
         return "vertical"                          # vertical stereo: let the caller try another order/partner
     if P2[0, 3] > 0:
@@ -127,7 +129,7 @@ def _stereo_pair(rec: Reconstruction, ia: int, ib: int, max_side: int, step: int
     dmin, dmax = f * B / zhi, f * B / zlo
     min_disp = int(math.floor(dmin)) - 2
     num = int(math.ceil((dmax - min_disp + 2) / 16.0)) * 16
-    num = max(16, min(num, 16 * 24))
+    num = max(16, min(num, 16 * 40))
     bs = 5
     sgbm = cv2.StereoSGBM_create(minDisparity=min_disp, numDisparities=num, blockSize=bs,
                                  P1=8 * 3 * bs * bs, P2=32 * 3 * bs * bs, disp12MaxDiff=1,
@@ -155,7 +157,7 @@ def _stereo_pair(rec: Reconstruction, ia: int, ib: int, max_side: int, step: int
     return Xw.astype(np.float32), C.astype(np.uint8)
 
 
-def densify(rec: Reconstruction, *, max_side: int = 1000, per_image: int = 2, step: int = 2,
+def densify(rec: Reconstruction, *, max_side: int = 1000, per_image: int = 3, step: int = 2,
             voxel: Optional[float] = None, min_support: int = 2,
             progress: Optional[Callable[[float, str], None]] = None) -> DenseCloud:
     pairs = choose_pairs(rec, per_image=per_image)
@@ -191,16 +193,42 @@ def densify(rec: Reconstruction, *, max_side: int = 1000, per_image: int = 2, st
     dims = np.max(keys, axis=0) + 1
     flat = (keys[:, 0] * dims[1] + keys[:, 1]) * dims[2] + keys[:, 2]
     uniq, inv, counts = np.unique(flat, return_inverse=True, return_counts=True)
-    # distinct pairs per voxel
-    pk = np.unique(np.stack([inv, pid], 1), axis=0)
-    support = np.bincount(pk[:, 0], minlength=len(uniq))
+    # Consistency is checked on a coarser grid (4 voxels): a surface must be
+    # seen by at least two different photo pairs there. Requiring two pairs in
+    # the *same tiny voxel* threw most real surface away (big gaps).
+    ck = keys // 3
+    cdims = np.max(ck, axis=0) + 1
+    cflat = (ck[:, 0] * cdims[1] + ck[:, 1]) * cdims[2] + ck[:, 2]
+    cu, cinv = np.unique(cflat, return_inverse=True)
+    cpk = np.unique(np.stack([cinv, pid], 1), axis=0)
+    csupport = np.bincount(cpk[:, 0], minlength=len(cu))
+    # fine voxel → its coarse cell's support
+    first = np.zeros(len(uniq), np.int64); first[inv] = np.arange(len(inv))
+    support = csupport[cinv[first]]
     sumP = np.zeros((len(uniq), 3)); sumC = np.zeros((len(uniq), 3))
     np.add.at(sumP, inv, P); np.add.at(sumC, inv, C)
     need = min_support if used >= 3 else 1
     keep = support >= need
     pts = (sumP[keep] / counts[keep, None]).astype(np.float32)
     cols = np.clip(sumC[keep] / counts[keep, None], 0, 255).astype(np.uint8)
-    return DenseCloud(points=pts, colors=cols, support=support[keep].astype(np.int32), pairs_used=used)
+    sup = support[keep].astype(np.int32)
+    # drop stragglers: points much farther from their neighbours than a surface
+    # point is (edge noise, mismatches); keeps the clean, object-shaped cloud
+    if len(pts) > 50:
+        good = remove_outliers(pts, k=10, std=2.0)
+        pts, cols, sup = pts[good], cols[good], sup[good]
+    return DenseCloud(points=pts, colors=cols, support=sup, pairs_used=used)
+
+
+def remove_outliers(points: np.ndarray, k: int = 10, std: float = 2.0) -> np.ndarray:
+    """Statistical outlier removal: keep points whose mean distance to their k
+    nearest neighbours is within mean + std·σ. Returns a boolean mask."""
+    from scipy.spatial import cKDTree
+    tree = cKDTree(points)
+    d, _ = tree.query(points, k=k + 1, workers=-1)
+    m = d[:, 1:].mean(1)
+    mu, sd = float(np.mean(m)), float(np.std(m))
+    return m <= mu + std * sd
 
 
 def write_ply(path: str, cloud: DenseCloud) -> None:
@@ -212,3 +240,113 @@ def write_ply(path: str, cloud: DenseCloud) -> None:
     rec["p"] = cloud.points; rec["c"] = cloud.colors
     with open(path, "wb") as f:
         f.write(header); f.write(rec.tobytes())
+
+
+# ───────────────────────────────────────────────────── Brush-ready cloud
+def _voxel_keys(P: np.ndarray, origin: np.ndarray, vox: float) -> np.ndarray:
+    k = np.floor((P - origin) / vox).astype(np.int64) + 1
+    return (k[:, 0] << 42) | (k[:, 1] << 21) | k[:, 2]
+
+
+def even_cloud(points: np.ndarray, colors: np.ndarray, target: int) -> Tuple[np.ndarray, np.ndarray, float]:
+    """One point per voxel (positions and colours averaged), with the voxel
+    size chosen so about `target` points remain: an evenly spaced cloud."""
+    P = points.astype(np.float64)
+    if len(P) <= target:
+        return points.astype(np.float32), colors, 0.0
+    lo, hi = P.min(0), P.max(0)
+    ext = float(np.max(hi - lo)) or 1.0
+    a, b = ext / 4000.0, ext / 20.0
+    for _ in range(24):                       # geometric bisection on the voxel size
+        mid = math.sqrt(a * b)
+        n = len(np.unique(_voxel_keys(P, lo, mid)))
+        if n > target: a = mid
+        else: b = mid
+    vox = b
+    keys = _voxel_keys(P, lo, vox)
+    uniq, inv, cnt = np.unique(keys, return_inverse=True, return_counts=True)
+    sp = np.zeros((len(uniq), 3)); sc = np.zeros((len(uniq), 3))
+    np.add.at(sp, inv, P); np.add.at(sc, inv, colors.astype(np.float64))
+    return (sp / cnt[:, None]).astype(np.float32), np.clip(sc / cnt[:, None], 0, 255).astype(np.uint8), vox
+
+
+def fill_small_gaps(points: np.ndarray, colors: np.ndarray, vox: float, passes: int = 2) -> Tuple[np.ndarray, np.ndarray, int]:
+    """Fill pin-holes in a surface: an empty voxel with filled voxels on both
+    sides of it (along any of the 13 directions) gets a point, coloured from
+    its neighbours. Only bridges gaps of one voxel per pass — it closes holes,
+    it doesn't invent new surfaces."""
+    if vox <= 0 or len(points) < 10:
+        return points, colors, 0
+    P, C = points.astype(np.float64), colors.astype(np.float64)
+    origin = P.min(0) - 4 * vox
+    added = 0
+    dirs = np.array([(1, 0, 0), (0, 1, 0), (0, 0, 1), (1, 1, 0), (1, -1, 0), (1, 0, 1), (1, 0, -1), (0, 1, 1), (0, 1, -1),
+                     (1, 1, 1), (1, 1, -1), (1, -1, 1), (1, -1, -1)], np.int64)
+    for _ in range(passes):
+        k = np.floor((P - origin) / vox).astype(np.int64)
+        enc = lambda q: (q[:, 0] << 42) | (q[:, 1] << 21) | q[:, 2]
+        occ = np.unique(enc(k))
+        has = lambda q: np.isin(enc(q), occ, assume_unique=False)
+        new_keys, new_pts, new_cols = [], [], []
+        for d in dirs:
+            mid, far = k + d, k + 2 * d
+            m = (~has(mid)) & has(far)
+            if not m.any():
+                continue
+            # the point on the other side: average of the two neighbours
+            fk = enc(far[m]); order = np.argsort(occ)
+            src = np.searchsorted(occ, fk)
+            # representative point of each far voxel: nearest original with that key
+            keyP = enc(k); sidx = np.argsort(keyP); sk = keyP[sidx]
+            j = sidx[np.clip(np.searchsorted(sk, fk), 0, len(sk) - 1)]
+            new_pts.append((P[m] + P[j]) / 2); new_cols.append((C[m] + C[j]) / 2); new_keys.append(enc(mid[m]))
+            del order, src
+        if not new_pts:
+            break
+        NP, NC, NK = np.concatenate(new_pts), np.concatenate(new_cols), np.concatenate(new_keys)
+        _, first = np.unique(NK, return_index=True)          # one per gap voxel
+        P = np.concatenate([P, NP[first]]); C = np.concatenate([C, NC[first]]); added += len(first)
+    return P.astype(np.float32), np.clip(C, 0, 255).astype(np.uint8), added
+
+
+def brush_cloud(rec: Reconstruction, dense: Optional[DenseCloud] = None, target: int = 300_000,
+                fill_gaps: bool = True) -> Tuple[np.ndarray, np.ndarray, dict]:
+    """The starting cloud for Brush: dense surface where stereo found it,
+    reliable sparse points (seen 3+ times) where it didn't, cleaned, evenly
+    spaced and with small holes closed."""
+    sp = [t for t in rec.points if len(t.obs) >= 3]
+    S = np.array([t.xyz for t in sp], np.float32) if sp else np.zeros((0, 3), np.float32)
+    SC = np.array([t.color for t in sp], np.uint8) if sp else np.zeros((0, 3), np.uint8)
+    info = {"sparse_used": 0, "dense_used": 0}
+    if dense is not None and len(dense):
+        P, C = dense.points, dense.colors
+        info["dense_used"] = len(P)
+        if len(S):
+            # sparse points only where the dense surface has nothing nearby
+            from scipy.spatial import cKDTree
+            ext = float(np.max(np.ptp(P, axis=0))) or 1.0
+            d, _ = cKDTree(P).query(S, k=1, distance_upper_bound=ext / 150)
+            gap = ~np.isfinite(d)
+            P = np.concatenate([P, S[gap]]); C = np.concatenate([C, SC[gap]]); info["sparse_used"] = int(gap.sum())
+    else:
+        P, C = S, SC
+        info["sparse_used"] = len(S)
+    if len(P) < 10:
+        raise ValueError("Not enough points for a Brush cloud — align first.")
+    good = remove_outliers(P, k=10, std=2.2)
+    P, C = P[good], C[good]
+    P, C, vox = even_cloud(P, C, target)
+    added = 0
+    if vox == 0 and len(P) > 20:
+        # already under the target: fill gaps at the cloud's own spacing
+        from scipy.spatial import cKDTree
+        d, _ = cKDTree(P).query(P[:: max(1, len(P) // 20000)], k=2)
+        vox = float(np.median(d[:, 1]))
+    if fill_gaps and vox > 0:
+        # holes are judged on a grid ~2× the spacing, where a surface is solid
+        # and only real holes are empty (finer grids see every gap between points)
+        P, C, added = fill_small_gaps(P, C, vox * 2.0, passes=1)
+        if len(P) > target * 1.15:                     # stay near the requested size
+            P, C, vox = even_cloud(P, C, target)
+    info.update(points=len(P), voxel=vox, gaps_filled=added)
+    return P, C, info

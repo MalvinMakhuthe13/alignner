@@ -5,6 +5,7 @@ Command-line alignment: a folder of photos → a COLMAP folder for Brush.
     python align.py photos/ out/ --features 12000 --focal 3100
     python align.py drone/ out/ --gps --level z --clean
     python align.py photos/ out/ --dense        # dense, object-shaped cloud for Brush
+    python align.py photos/ out/ --dense --brush 300000   # even, gap-filled start for Brush
 
 The output folder contains images/ and sparse/0/ (binary + text) and
 sparse_points.ply. Open it in Brush to train the splat.
@@ -35,6 +36,8 @@ def main(argv=None) -> int:
     ap.add_argument("--gps", action="store_true", help="scale to metres and orient east-north-up from photo GPS")
     ap.add_argument("--clean", action="store_true", help="drop stray sparse points (statistical outliers)")
     ap.add_argument("--dense", action="store_true", help="build a dense cloud (looks like the object) and start Brush from it")
+    ap.add_argument("--brush", type=int, default=0, metavar="N",
+                    help="start Brush from an even, cleaned, gap-filled cloud of about N points (uses --dense if given)")
     ap.add_argument("-q", "--quiet", action="store_true")
     a = ap.parse_args(argv)
 
@@ -75,6 +78,14 @@ def main(argv=None) -> int:
         Path(a.out).mkdir(parents=True, exist_ok=True)
         write_ply(str(Path(a.out) / "dense_points.ply"), cloud)
         print(f"Dense cloud: {len(cloud):,} points from {cloud.pairs_used} photo pairs")
+    if a.brush:
+        from src.dense import brush_cloud, write_ply, DenseCloud
+        import numpy as np
+        P, C, binfo = brush_cloud(rec, cloud if a.dense else None, target=a.brush)
+        extra = (P, C)
+        Path(a.out).mkdir(parents=True, exist_ok=True)
+        write_ply(str(Path(a.out) / "brush_points.ply"), DenseCloud(points=P, colors=C, support=np.zeros(len(P), np.int32), pairs_used=0))
+        print(f"Brush-ready cloud: {binfo['points']:,} points ({binfo['gaps_filled']:,} gaps filled)")
     info = export_colmap(rec, a.out, extra_points=extra)
     print(json.dumps({**rec.stats(), **info}, indent=2))
     return 0
