@@ -21,7 +21,8 @@ build/
 Thumbs.db
 
 # Streamlit
-.streamlit/
+.streamlit/*
+!.streamlit/config.toml
 
 # Temp / uploads
 tmp/
@@ -31,3 +32,4 @@ _alignner_upgrade/
 alignner_intelligent_selection_git_ready/
 *.zip
 *.bak
+.venv/

@@ -1,0 +1,28 @@
+name: Alignner tests
+on:
+  push:
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - name: Install
+        run: pip install opencv-python-headless numpy scipy pillow pytest
+      - name: SfM, scene tools, dense and Brush-ready cloud
+        run: python -m pytest -q tests
+      - name: Desktop launcher starts and stops a server
+        run: |
+          ALIGNNER_HOME=$RUNNER_TEMP/al ALIGNNER_NO_UPDATE=1 python desktop/alignner_desktop.py \
+            --server-cmd "python -m http.server {port} --bind 127.0.0.1" --health-path / --exit-after-start
+      - name: Command line end to end
+        run: |
+          python - <<'PY'
+          from tests.synthetic_scene import make_scene
+          make_scene('/tmp/photos', n=16)
+          PY
+          python align.py /tmp/photos /tmp/out --level y --clean --dense --brush 100000 -q
+          test -f /tmp/out/sparse/0/points3D.bin && test -f /tmp/out/brush_points.ply
