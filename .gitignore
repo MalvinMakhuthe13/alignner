@@ -32,3 +32,4 @@ _alignner_upgrade/
 alignner_intelligent_selection_git_ready/
 *.zip
 *.bak
+.venv/

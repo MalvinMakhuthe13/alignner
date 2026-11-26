@@ -6,6 +6,20 @@ Prototype inspired by the alignment stage in [RealityScan](https://www.realitysc
 
 Upload photos **or videos**. Videos are automatically turned into frames and then aligned.
 
+
+## Open Alignner like a normal app (Windows)
+
+No terminal, no `localhost`: set it up once, then just double-click the icon.
+
+1. Install Python 3.10+ from https://www.python.org/downloads/ (tick **Add python.exe to PATH**).
+2. In this folder, open `desktop` and double-click **`install_windows.bat`**.
+   It installs what Alignner needs into a private `.venv` and puts an **Alignner** icon on your desktop and in the Start menu.
+3. Double-click **Alignner**. It opens in its own window; closing the window stops it.
+
+Each time it opens it also pulls the latest version from GitHub (when you're online and haven't changed files here) and installs new requirements if needed.
+Logs are in `%USERPROFILE%\.alignner\`. To remove the icons run `desktop\uninstall_windows.bat`.
+macOS / Linux: run `desktop/install_mac_linux.sh`.
+
 ## What it does
 
 Real incremental Structure-from-Motion on the CPU (no AI, no GPU):
