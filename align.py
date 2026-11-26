@@ -4,6 +4,7 @@ Command-line alignment: a folder of photos → a COLMAP folder for Brush.
     python align.py photos/ out/
     python align.py photos/ out/ --features 12000 --focal 3100
     python align.py drone/ out/ --gps --level z --clean
+    python align.py photos/ out/ --dense        # dense, object-shaped cloud for Brush
 
 The output folder contains images/ and sparse/0/ (binary + text) and
 sparse_points.ply. Open it in Brush to train the splat.
@@ -33,6 +34,7 @@ def main(argv=None) -> int:
     ap.add_argument("--level", choices=["y", "z"], help="level the scene: y-up (Fumoca/Brush) or z-up (RealityScan/Blender), and centre it")
     ap.add_argument("--gps", action="store_true", help="scale to metres and orient east-north-up from photo GPS")
     ap.add_argument("--clean", action="store_true", help="drop stray sparse points (statistical outliers)")
+    ap.add_argument("--dense", action="store_true", help="build a dense cloud (looks like the object) and start Brush from it")
     ap.add_argument("-q", "--quiet", action="store_true")
     a = ap.parse_args(argv)
 
@@ -65,7 +67,15 @@ def main(argv=None) -> int:
         T.level_scene(rec, up_axis=a.level)
     if a.clean:
         print(f"Removed {T.clean_points(rec):,} stray points")
-    info = export_colmap(rec, a.out)
+    extra = None
+    if a.dense:
+        from src.dense import densify, write_ply
+        cloud = densify(rec)
+        extra = (cloud.points, cloud.colors)
+        Path(a.out).mkdir(parents=True, exist_ok=True)
+        write_ply(str(Path(a.out) / "dense_points.ply"), cloud)
+        print(f"Dense cloud: {len(cloud):,} points from {cloud.pairs_used} photo pairs")
+    info = export_colmap(rec, a.out, extra_points=extra)
     print(json.dumps({**rec.stats(), **info}, indent=2))
     return 0
 

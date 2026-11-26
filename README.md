@@ -29,6 +29,7 @@ On synthetic scenes with known cameras it recovers poses to <0.02 % of the scene
 2. **Align** — Preview / Normal / High detail presets; cameras placed, points, error, components, lens
 3. **Inspect** — 3D view with camera frustums coloured by fit quality; per-image quality analysis (error, points seen, frame coverage)
 4. **Scene** — level (Y-up for Fumoca/Brush, Z-up for RealityScan/Blender) and centre; georeference from photo GPS (metres, east-north-up); define a known distance; clean stray points / crop to the main region
+   - **Dense cloud** — stereo matching between neighbouring photos fused into a dense, clean, coloured cloud that already looks like the object; Brush can start from it
 5. **Export** — COLMAP folder for Brush (.zip), sparse point cloud (.ply), report (.json)
 
 ## Command line
@@ -50,6 +51,7 @@ python align.py drone_photos out_colmap --gps --level z --clean
 ```bash
 python tests/test_sfm.py          # end-to-end on rendered scenes with known cameras
 python tests/test_scene_tools.py  # level, GPS, define distance, cleanup
+python tests/test_dense.py         # dense cloud lies on the true surfaces
 python -m pytest -q tests/test_image_selector.py
 ```
 

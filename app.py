@@ -21,6 +21,7 @@ import streamlit as st
 from src.image_selector import IntelligentImageSelector
 from src.sfm import IncrementalSfM, camera_center, export_colmap
 from src import scene_tools as T
+from src.dense import densify, write_ply
 
 st.set_page_config(page_title="Alignner", page_icon="📷", layout="wide", initial_sidebar_state="expanded")
 
@@ -123,10 +124,15 @@ def err_color(e):
     return f"rgb({r},{g},60)"
 
 
-def scene_figure(rec, show_cams=True, show_pts=True, max_pts=60000, pt_size=1.6):
+def scene_figure(rec, show_cams=True, show_pts=True, max_pts=60000, pt_size=1.6, dense=None):
     fig = go.Figure()
     reg = rec.registered_views
-    if show_pts and rec.points:
+    if show_pts and dense is not None and len(dense):
+        ix = np.random.default_rng(0).choice(len(dense), min(max_pts, len(dense)), replace=False)
+        P = dense.points[ix].astype(np.float64); C = dense.colors[ix]
+        fig.add_trace(go.Scatter3d(x=P[:, 0], y=P[:, 1], z=P[:, 2], mode="markers", name="Dense cloud",
+                                   marker=dict(size=pt_size, color=[f"rgb({r},{g},{b})" for r, g, b in C]), hoverinfo="skip"))
+    elif show_pts and rec.points:
         pts = rec.points
         ix = np.random.default_rng(0).choice(len(pts), min(max_pts, len(pts)), replace=False)
         P = np.array([pts[i].xyz for i in ix]); C = np.array([pts[i].color for i in ix])
@@ -274,7 +280,9 @@ with t_inspect:
         show_pts = c[1].toggle("Points", True)
         pt_size = c[2].slider("Point size", 0.5, 4.0, 1.6, 0.1)
         max_pts = c[3].select_slider("Max points shown", [10000, 30000, 60000, 120000], 60000)
-        st.plotly_chart(scene_figure(rec, show_cams, show_pts, max_pts, pt_size), use_container_width=True)
+        dense = ss.get("dense")
+        use_dense = dense is not None and st.toggle("Show dense cloud", True)
+        st.plotly_chart(scene_figure(rec, show_cams, show_pts, max_pts, pt_size, dense if use_dense else None), use_container_width=True)
         st.caption("Camera dots are coloured by their error: green = sharp fit, red = poor fit or worth re-shooting.")
         st.subheader("Quality analysis")
         rows = [{"Image": x.name, "Placed": "✓" if x.registered else "✗", "Features": x.features,
@@ -333,14 +341,30 @@ with t_scene:
                     pad = (hi - lo) * 0.15
                     n += T.crop_to_region(rec, lo - pad, hi + pad)
                 log.append(f"Removed {n:,} weak/stray points ({len(rec.points):,} left)")
+        st.markdown("**Dense cloud — see the real object**")
+        st.caption("Stereo-matches neighbouring photos and fuses the depth into a dense, clean, coloured cloud "
+                   "that already looks like the object (like RealityScan / OpenMVS). Brush can start training from it.")
+        dq = st.radio("Detail", ["Preview", "Normal", "High"], index=1, horizontal=True)
+        if st.button("Build dense cloud", type="primary"):
+            side, step = {"Preview": (700, 3), "Normal": (1000, 2), "High": (1600, 1)}[dq]
+            bar = st.progress(0.0)
+            try:
+                ss["dense"] = densify(rec, max_side=side, step=step, progress=lambda f, m: bar.progress(min(1.0, f), m))
+                ss["dense_log_len"] = len(log)
+                log.append(f"Dense cloud: {len(ss['dense']):,} points from {ss['dense'].pairs_used} photo pairs")
+            except ValueError as e:
+                st.error(str(e))
+        if ss.get("dense") is not None and ss.get("dense_log_len", -1) < len(log) - 1:
+            ss.pop("dense", None)                    # model changed after the dense build
+            st.info("The scene changed — build the dense cloud again.")
         if log:
             st.success(" · ".join(log[-3:]))
             if ss.get("export_log_len") != len(log):
                 ss.pop("export_zip", None)          # scene changed → export must be prepared again
         if st.button("↺ Reset scene edits"):
-            ss["rec"] = copy.deepcopy(ss["rec_aligned"]); ss["scene_log"] = []; ss.pop("export_zip", None)
+            ss["rec"] = copy.deepcopy(ss["rec_aligned"]); ss["scene_log"] = []; ss.pop("export_zip", None); ss.pop("dense", None)
             st.rerun()
-        st.plotly_chart(scene_figure(rec, True, True, 40000, 1.6), use_container_width=True)
+        st.plotly_chart(scene_figure(rec, True, True, 40000, 1.6, ss.get("dense")), use_container_width=True)
 
 with t_export:
     rec = ss.get("rec")
@@ -349,11 +373,20 @@ with t_export:
     else:
         out_dir = Path(ss["out_dir"])
         st.markdown('<div class="an-step">The COLMAP folder opens directly in Brush (and gsplat, Nerfstudio, COLMAP). Scene edits from ④ are included.</div>', unsafe_allow_html=True)
+        dense = ss.get("dense")
+        add_dense = dense is not None and st.checkbox(f"Start Brush from the dense cloud ({len(dense):,} points) — better first look and detail", True)
+        if dense is None:
+            st.caption("Tip: build the dense cloud in ④ Scene for a cleaner start in Brush.")
         if st.button("Prepare export", type="primary"):
             if out_dir.exists():
                 shutil.rmtree(out_dir)
             with st.spinner("Writing COLMAP model and images…"):
-                info = export_colmap(rec, str(out_dir))
+                info = export_colmap(rec, str(out_dir), extra_points=(dense.points, dense.colors) if add_dense else None)
+                if dense is not None:
+                    write_ply(str(out_dir / "dense_points.ply"), dense)
+                    ss["export_dense"] = (out_dir / "dense_points.ply").read_bytes()
+                else:
+                    ss.pop("export_dense", None)
                 report = {**rec.stats(), **info, "scene_edits": ss.get("scene_log", []),
                           "cameras": [{"id": c.id, "width": c.width, "height": c.height, "f": c.f, "k1": c.k} for c in rec.cameras.values()]}
                 (out_dir / "alignner_report.json").write_text(json.dumps(report, indent=2))
@@ -363,8 +396,11 @@ with t_export:
                 ss["export_log_len"] = len(ss.get("scene_log", []))
         if "export_zip" in ss:
             info = ss["export_info"]
-            st.success(f"{info['images']} cameras · {info['points']:,} points" + (" · images undistorted for training" if info["undistorted"] else ""))
-            c = st.columns(3)
+            st.success(f"{info['images']} cameras · {info['points']:,} sparse points" + (f" + {info['dense_points']:,} dense" if info.get('dense_points') else "")
+                       + (" · images undistorted for training" if info["undistorted"] else ""))
+            c = st.columns(4)
+            if ss.get("export_dense"):
+                c[3].download_button("⬇️ Dense cloud (.ply)", ss["export_dense"], "dense_points.ply")
             c[0].download_button("⬇️ COLMAP folder for Brush (.zip)", ss["export_zip"], "alignner_colmap.zip", "application/zip", type="primary")
             c[1].download_button("⬇️ Sparse point cloud (.ply)", ss["export_ply"], "sparse_points.ply")
             c[2].download_button("⬇️ Report (.json)", (out_dir / "alignner_report.json").read_bytes(), "alignner_report.json")

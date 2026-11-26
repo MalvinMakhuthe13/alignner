@@ -827,7 +827,7 @@ def _qvec(rvec) -> np.ndarray:
 
 
 def export_colmap(rec: Reconstruction, out_dir: str, *, undistort_threshold: float = 0.005,
-                  copy_images: bool = True) -> dict:
+                  copy_images: bool = True, extra_points=None) -> dict:
     """
     Write a COLMAP model Brush / gsplat / Nerfstudio can train on:
 
@@ -841,6 +841,9 @@ def export_colmap(rec: Reconstruction, out_dir: str, *, undistort_threshold: flo
     Cameras are written as PINHOLE (what splat trainers expect). If the
     estimated radial distortion is non-negligible the images are undistorted
     so that PINHOLE is exact.
+
+    extra_points: optional (points Nx3, colors Nx3 uint8), e.g. a dense
+    cloud, appended to points3D without tracks so trainers start from it.
     """
     out = Path(out_dir)
     img_dir = out / "images"
@@ -905,6 +908,9 @@ def export_colmap(rec: Reconstruction, out_dir: str, *, undistort_threshold: flo
     idx_in_image = {row[0]: {k: n for n, k in enumerate(row[6])} for row in image_rows}
     by_view = {v.id: img_id[v.id] for v in reg}
 
+    ex_p = np.zeros((0, 3)) if extra_points is None else np.asarray(extra_points[0], dtype=np.float64)
+    ex_c = np.zeros((0, 3), np.uint8) if extra_points is None else np.asarray(extra_points[1], dtype=np.uint8)
+
     # ---------- text
     with open(sp / "cameras.txt", "w") as f:
         f.write("# Camera list with one line of data per camera:\n#   CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n")
@@ -922,12 +928,14 @@ def export_colmap(rec: Reconstruction, out_dir: str, *, undistort_threshold: flo
     with open(sp / "points3D.txt", "w") as f:
         f.write("# 3D point list with one line of data per point:\n"
                 "#   POINT3D_ID, X, Y, Z, R, G, B, ERROR, TRACK[] as (IMAGE_ID, POINT2D_IDX)\n")
-        f.write(f"# Number of points: {len(pts)}\n")
+        f.write(f"# Number of points: {len(pts) + len(ex_p)}\n")
         for t in pts:
             tr = [(by_view[v], idx_in_image[by_view[v]][kp]) for v, kp in t.obs.items() if v in by_view and kp in idx_in_image[by_view[v]]]
             col = t.color if t.color is not None else np.array([128, 128, 128])
             f.write(f"{pid[id(t)]} {t.xyz[0]!r} {t.xyz[1]!r} {t.xyz[2]!r} {int(col[0])} {int(col[1])} {int(col[2])} {t.error!r} "
                     + " ".join(f"{a} {b}" for a, b in tr) + "\n")
+        for k, (x, c) in enumerate(zip(ex_p, ex_c)):
+            f.write(f"{len(pts) + k + 1} {float(x[0])!r} {float(x[1])!r} {float(x[2])!r} {int(c[0])} {int(c[1])} {int(c[2])} 1.0\n")
 
     # ---------- binary (COLMAP's native format; most trainers prefer it)
     with open(sp / "cameras.bin", "wb") as f:
@@ -945,7 +953,7 @@ def export_colmap(rec: Reconstruction, out_dir: str, *, undistort_threshold: flo
             for x, y, p in p2d:
                 f.write(struct.pack("<ddq", x, y, p))
     with open(sp / "points3D.bin", "wb") as f:
-        f.write(struct.pack("<Q", len(pts)))
+        f.write(struct.pack("<Q", len(pts) + len(ex_p)))
         for t in pts:
             tr = [(by_view[v], idx_in_image[by_view[v]][kp]) for v, kp in t.obs.items() if v in by_view and kp in idx_in_image[by_view[v]]]
             col = t.color if t.color is not None else np.array([128, 128, 128])
@@ -953,6 +961,9 @@ def export_colmap(rec: Reconstruction, out_dir: str, *, undistort_threshold: flo
             f.write(struct.pack("<Q", len(tr)))
             for a, b in tr:
                 f.write(struct.pack("<ii", a, b))
+        for k, (x, c) in enumerate(zip(ex_p, ex_c)):
+            f.write(struct.pack("<Q3d3Bd", len(pts) + k + 1, float(x[0]), float(x[1]), float(x[2]), int(c[0]), int(c[1]), int(c[2]), 1.0))
+            f.write(struct.pack("<Q", 0))
 
     # sparse point cloud for quick inspection
     with open(out / "sparse_points.ply", "w") as f:
@@ -963,7 +974,7 @@ def export_colmap(rec: Reconstruction, out_dir: str, *, undistort_threshold: flo
             col = t.color if t.color is not None else (128, 128, 128)
             f.write(f"{t.xyz[0]:.6f} {t.xyz[1]:.6f} {t.xyz[2]:.6f} {int(col[0])} {int(col[1])} {int(col[2])}\n")
 
-    return {"path": str(out), "images": len(image_rows), "points": len(pts), "cameras": len(used_cams),
+    return {"path": str(out), "images": len(image_rows), "points": len(pts), "dense_points": len(ex_p), "cameras": len(used_cams),
             "undistorted": any(undistort.values())}
 
 
