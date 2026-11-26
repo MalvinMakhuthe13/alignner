@@ -240,11 +240,11 @@ class IncrementalSfM:
         if self.detector_name == "orb":
             return cv2.ORB_create(nfeatures=self.max_features * 3, scaleFactor=1.2, nlevels=8)
         # detect generously (incl. low-contrast detail), then spread evenly below
-        return cv2.SIFT_create(nfeatures=self.max_features * 3, contrastThreshold=0.02)
+        return cv2.SIFT_create(nfeatures=self.max_features * 3, contrastThreshold=0.03)
 
     def _spread(self, kps, desc, w: int, h: int):
         """Keep `max_features`, spread evenly over the photo: each cell of a grid
-        gets an equal share of its strongest features, the rest go to the
+        gets an equal share (half the budget) of its strongest features, the rest go to the
         strongest overall. Plain "strongest N" clusters on busy texture and
         leaves plain areas empty — uneven, gappy sparse clouds."""
         n = len(kps)
@@ -253,7 +253,7 @@ class IncrementalSfM:
         gx, gy = 16, max(4, round(16 * h / max(1, w)))
         resp = np.array([k.response for k in kps]); pts = np.array([k.pt for k in kps])
         cell = (np.minimum(gy - 1, (pts[:, 1] * gy / h).astype(int)) * gx + np.minimum(gx - 1, (pts[:, 0] * gx / w).astype(int)))
-        quota = max(1, int(self.max_features * 0.7) // (gx * gy))
+        quota = max(1, int(self.max_features * 0.5) // (gx * gy))
         order = np.lexsort((-resp, cell))                  # by cell, strongest first
         rank = np.empty(n, int); start = 0
         sc = cell[order]
